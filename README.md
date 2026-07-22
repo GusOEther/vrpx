@@ -45,6 +45,10 @@ History, not prediction. No per-strike option quotes (none exist for free histor
 
 A GitHub Action (`.github/workflows/build.yml`) rebuilds the report every weekday after US close and publishes it to GitHub Pages. If a data source fails, the previous day's page stays live.
 
+## Credits
+
+The dashboard concept and visual language pay homage to **Tomas Byron's "VRPX PRO"** ([YouTube](https://www.youtube.com/watch?v=cHPew0fKbgQ)). This is an independent rebuild: free public data only, and all scoring/regime/backtest logic is our own and fully disclosed in the Settings tab.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

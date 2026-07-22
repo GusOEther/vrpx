@@ -595,6 +595,9 @@ TEMPLATE = r"""<title>VRPX — Volatility Risk Premium Analyzer (open-data rebui
   .topbar{display:flex;align-items:baseline;gap:18px;padding:6px 2px 14px;flex-wrap:wrap}
   .brand{font-size:26px;font-weight:700;letter-spacing:2px;color:#eef4fa} .brand b{color:var(--green)}
   .subtitle{color:var(--ink-faint);letter-spacing:4px;font-size:11px;text-transform:uppercase}
+  .subtitle .homage{color:var(--ink-faint);text-decoration:none;border-bottom:1px dotted var(--ink-faint);
+    letter-spacing:1px;text-transform:none;transition:.15s}
+  .subtitle .homage:hover{color:var(--green);border-color:var(--green)}
   .top-right{margin-left:auto;display:flex;align-items:center;gap:16px;font-size:12px;flex-wrap:wrap}
   .kv{display:flex;gap:6px;align-items:baseline} .kv .k{color:var(--ink-faint);letter-spacing:1px}
   .kv .v{color:#eef4fa;font-weight:600;font-variant-numeric:tabular-nums}
@@ -703,7 +706,9 @@ TEMPLATE = r"""<title>VRPX — Volatility Risk Premium Analyzer (open-data rebui
 <div class="app">
   <div class="topbar">
     <div class="brand"><b>VRPX</b></div>
-    <div class="subtitle">Volatility Risk Premium Term Structure Analyzer · open-data rebuild</div>
+    <div class="subtitle">Volatility Risk Premium Term Structure Analyzer · open-data rebuild
+      · <a class="homage" href="https://www.youtube.com/watch?v=cHPew0fKbgQ" target="_blank" rel="noopener"
+           data-tip="Homage: this dashboard is an independent open-data rebuild inspired by Tomas Byron's VRPX PRO (YouTube). Free public data only; all scoring logic is our own and disclosed in Settings.">inspired by Tomas Byron's VRPX PRO ↗</a></div>
     <div class="top-right">
       <span class="badge" id="t-badge" data-tip="Data status: green when all five free sources (SPX + VIX family) are fresh; degrades to n/5 with a warning if a source goes stale.">●</span>
       <span class="kv" data-tip="S&P 500 close (^GSPC, Yahoo) on the as-of date."><span class="k">SPX</span><span class="v" id="t-spx"></span></span>
