@@ -707,8 +707,12 @@ TEMPLATE = r"""<title>VRPX — Volatility Risk Premium Analyzer (open-data rebui
   <div class="topbar">
     <div class="brand"><b>VRPX</b></div>
     <div class="subtitle">Volatility Risk Premium Term Structure Analyzer · open-data rebuild
-      · <a class="homage" href="https://www.youtube.com/watch?v=cHPew0fKbgQ" target="_blank" rel="noopener"
-           data-tip="Homage: this dashboard is an independent open-data rebuild inspired by Tomas Byron's VRPX PRO (YouTube). Free public data only; all scoring logic is our own and disclosed in Settings.">inspired by Tomas Byron's VRPX PRO ↗</a></div>
+      · inspired by <a class="homage" href="https://atmoptionsedge.ch/" target="_blank" rel="noopener"
+           data-tip="Tomas Byron's homepage — ATM Options Edge. This dashboard is an independent open-data rebuild of his VRPX PRO; free public data only, all scoring logic our own and disclosed in Settings.">Tomas Byron</a>'s
+      <a class="homage" href="https://www.youtube.com/watch?v=cHPew0fKbgQ" target="_blank" rel="noopener"
+           data-tip="The original VRPX PRO walkthrough video that inspired this rebuild.">VRPX PRO</a>
+      · <a class="homage" href="https://www.youtube.com/@tombyr4907" target="_blank" rel="noopener"
+           data-tip="Tomas Byron's YouTube channel.">YT ↗</a></div>
     <div class="top-right">
       <span class="badge" id="t-badge" data-tip="Data status: green when all five free sources (SPX + VIX family) are fresh; degrades to n/5 with a warning if a source goes stale.">●</span>
       <span class="kv" data-tip="S&P 500 close (^GSPC, Yahoo) on the as-of date."><span class="k">SPX</span><span class="v" id="t-spx"></span></span>

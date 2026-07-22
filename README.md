@@ -47,7 +47,7 @@ A GitHub Action (`.github/workflows/build.yml`) rebuilds the report every weekda
 
 ## Credits
 
-The dashboard concept and visual language pay homage to **Tomas Byron's "VRPX PRO"** ([YouTube](https://www.youtube.com/watch?v=cHPew0fKbgQ)). This is an independent rebuild: free public data only, and all scoring/regime/backtest logic is our own and fully disclosed in the Settings tab.
+The dashboard concept and visual language pay homage to **Tomas Byron's "VRPX PRO"** — [homepage (ATM Options Edge)](https://atmoptionsedge.ch/) · [YouTube channel](https://www.youtube.com/@tombyr4907) · [the original walkthrough video](https://www.youtube.com/watch?v=cHPew0fKbgQ). This is an independent rebuild: free public data only, and all scoring/regime/backtest logic is our own and fully disclosed in the Settings tab.
 
 ## License
 

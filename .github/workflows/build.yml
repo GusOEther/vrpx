@@ -4,6 +4,8 @@ on:
   schedule:
     - cron: "30 23 * * 1-5"   # weekdays 23:30 UTC — after US close & index settlement
   workflow_dispatch:           # manual runs from the Actions tab
+  push:
+    branches: [main]           # every push redeploys with fresh data
 
 permissions:
   contents: read
