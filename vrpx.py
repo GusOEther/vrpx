@@ -303,6 +303,109 @@ def regime_block(px, labels, slope, up, vrp_hist30, vrp_now30):
 
 
 # --------------------------------------------------------------------------- #
+# regime forecast (C2: streak-adjusted persistence) + retroactive calibration
+#   Chosen over a 4-component ensemble by measurement (Ticket 04): streak-adjusted
+#   persistence alone beat every combination (LogLoss 0.923, top-1 67.5%). Horizon
+#   is 5 trading days — behaviour features have ~zero persistence at 21d (Ticket 04b).
+# --------------------------------------------------------------------------- #
+FC_H = 5          # forecast horizon, trading days
+CAL_START = "2016-01-01"
+
+def _streak_bucket(s):
+    return 0 if s <= 3 else (1 if s <= 10 else 2)
+
+def forecast_block(px, labels):
+    K = len(REG_ORDER)
+    idx = {l: i for i, l in enumerate(REG_ORDER)}
+    L = np.array([idx[x] for x in labels.to_numpy()])
+    n = len(L)
+    streak = np.ones(n, int)
+    for i in range(1, n):
+        streak[i] = streak[i - 1] + 1 if L[i] == L[i - 1] else 1
+
+    M = np.ones((K, K))            # Laplace-smoothed transition counts (day+H)
+    PS = np.ones((K, 3, 2))        # [regime, streak-bucket, {stay, go}]
+    nxt = 0
+    dates = labels.index
+    cal_start_pos = dates.get_loc(dates[dates >= CAL_START][0]) if (dates >= CAL_START).any() else n
+
+    def dist_at(t):
+        """C2 forecast distribution from counters as they stand (expanding)."""
+        pstay = PS[L[t], _streak_bucket(streak[t]), 0] / PS[L[t], _streak_bucket(streak[t])].sum()
+        off = M[L[t]].copy(); off[L[t]] = 0
+        off = off / off.sum() if off.sum() > 0 else np.full(K, 1.0 / K)
+        pr = off * (1 - pstay); pr[L[t]] += pstay
+        return pr / pr.sum()
+
+    journal, cal = [], []
+    for t in range(n):
+        while nxt + FC_H <= t:                 # fold in every resolved pair s -> s+H
+            s = nxt
+            M[L[s], L[s + FC_H]] += 1
+            PS[L[s], _streak_bucket(streak[s]), 0 if L[s + FC_H] == L[s] else 1] += 1
+            nxt += 1
+        if t >= cal_start_pos and t + FC_H < n:
+            pr = dist_at(t)
+            top = int(np.argmax(pr))
+            cal.append((float(pr[top]), int(top == L[t + FC_H])))
+
+    # current forecast (counters now hold every resolved pair up to today)
+    t = n - 1
+    pr = dist_at(t)
+    order = np.argsort(pr)[::-1]
+    top, second = int(order[0]), int(order[1])
+    fc = [jnum(x * 100, 1) for x in pr]
+
+    # retroactive calibration curve
+    cdf = pd.DataFrame(cal, columns=["conf", "hit"])
+    edges = [0.30, 0.50, 0.70, 0.90, 1.01]
+    labels_b = ["30-50%", "50-70%", "70-90%", "90-100%"]
+    buckets = []
+    for lo, hi, nm in zip([0.30, 0.50, 0.70, 0.90], edges[1:], labels_b):
+        m = (cdf["conf"] >= lo) & (cdf["conf"] < hi)
+        sub = cdf[m]
+        buckets.append(dict(bucket=nm, n=int(len(sub)),
+                            conf=jnum(sub["conf"].mean() * 100, 0) if len(sub) else None,
+                            acc=jnum(sub["hit"].mean() * 100, 0) if len(sub) else None,
+                            err=jnum((sub["hit"].mean() - sub["conf"].mean()) * 100, 0) if len(sub) else None))
+    ov_conf = float(cdf["conf"].mean()) if len(cdf) else 0.0
+    ov_acc = float(cdf["hit"].mean()) if len(cdf) else 0.0
+    bias_pp = (ov_acc - ov_conf) * 100
+    quality = int(round(100 - min(abs(bias_pp) + cdf.assign(e=(cdf["hit"] - cdf["conf"]).abs())["e"].mean() * 100 if len(cdf) else 100, 100)))
+
+    # journal: last ~15 days, each forecast made with counters strictly up to that day
+    # (last FC_H are PENDING — no resolved actual yet). Fresh causal replay.
+    journal = []
+    Mj = np.ones((K, K)); PSj = np.ones((K, 3, 2)); nj = 0
+    def dist_j(t):
+        ps = PSj[L[t], _streak_bucket(streak[t]), 0] / PSj[L[t], _streak_bucket(streak[t])].sum()
+        off = Mj[L[t]].copy(); off[L[t]] = 0
+        off = off / off.sum() if off.sum() > 0 else np.full(K, 1.0 / K)
+        pr = off * (1 - ps); pr[L[t]] += ps
+        return pr / pr.sum()
+    for t in range(n):
+        while nj + FC_H <= t:
+            s = nj; Mj[L[s], L[s + FC_H]] += 1
+            PSj[L[s], _streak_bucket(streak[s]), 0 if L[s + FC_H] == L[s] else 1] += 1; nj += 1
+        if t >= n - 15:
+            prj = dist_j(t); tp = int(np.argmax(prj))
+            actual = REG_ORDER[L[t + FC_H]] if t + FC_H < n else None
+            status = "PENDING" if actual is None else ("HIT" if tp == L[t + FC_H] else "MISS")
+            journal.append(dict(date=dates[t].strftime("%Y-%m-%d"), regime=REG_ORDER[L[t]],
+                                pred=REG_ORDER[tp], prob=jnum(float(prj[tp]) * 100, 0),
+                                actual=actual, status=status))
+    journal.reverse()
+
+    return dict(horizon=FC_H, order=REG_ORDER, colors=[REG_COLOR[l] for l in REG_ORDER],
+                dist=fc, top=REG_ORDER[top], top_prob=jnum(float(pr[top]) * 100, 1),
+                second=REG_ORDER[second], second_prob=jnum(float(pr[second]) * 100, 1),
+                calib=dict(buckets=buckets, bias_pp=jnum(bias_pp, 0), quality=quality,
+                           overall_conf=jnum(ov_conf * 100, 0), overall_acc=jnum(ov_acc * 100, 0),
+                           bias="Overconfident" if bias_pp < 0 else "Underconfident", n=int(len(cdf))),
+                journal=journal, cal_from=CAL_START[:4])
+
+
+# --------------------------------------------------------------------------- #
 # validation: does high current VRP predict higher captured premium?
 # --------------------------------------------------------------------------- #
 def validation_block(vrp_now30, vrp_hist30):
@@ -582,6 +685,7 @@ def build_data(px):
         colors=CARD_COLORS,
         charts=ch,
         regime=regime_block(px, labels, slope, up, series[30]["vrp_hist"], series[30]["vrp_now"]),
+        forecast=forecast_block(px, labels),
         validation=validation_block(series[30]["vrp_now"], series[30]["vrp_hist"]),
         backtest=backtest_block(px, series[30]["iv"], labels, series[30]["vrp_now"], rate),
         matrix=vrp_matrix_block(series),
@@ -618,7 +722,8 @@ def main():
 # --------------------------------------------------------------------------- #
 # HTML  (all tabs interactive; JS renders from embedded JSON)
 # --------------------------------------------------------------------------- #
-TEMPLATE = r"""<title>VRPX — Volatility Risk Premium Analyzer (open-data rebuild)</title>
+TEMPLATE = r"""<meta charset="utf-8">
+<title>VRPX — Volatility Risk Premium Analyzer (open-data rebuild)</title>
 <style>
   :root{
     --bg:#05070a;--panel:#0a0e14;--panel-2:#0c1119;--line:#141c26;--line-2:#1c2733;
@@ -869,11 +974,19 @@ TEMPLATE = r"""<title>VRPX — Volatility Risk Premium Analyzer (open-data rebui
   </div>
 
   <div class="panel" data-panel="forecast">
+    <div class="box"><div class="box-title" id="fc-head"></div>
+      <div class="box-note" style="margin-top:0" id="fc-sub"></div>
+      <div class="reg-grid" id="fc-cards" style="margin-top:10px"></div></div>
+    <div class="box"><div class="box-title" id="fc-title"></div><div id="fc-bars"></div>
+      <div class="box-note">Next-regime probabilities over the forecast horizon. Model = streak-adjusted persistence (P(stay | regime, streak bucket), remainder from the transition off-diagonal) — chosen over a 4-component ensemble by measurement (LogLoss 0.923). A regime-state estimate, <b>not</b> a forecast of SPX, VIX, returns or trade profitability.</div></div>
+    <div class="box"><div class="box-title" id="fc-cal-title"></div>
+      <table class="tbl" id="fc-cal"><thead><tr><th>Forecast confidence</th><th>N</th><th>Avg confidence</th><th>Actual accuracy</th><th>Calibration error</th></tr></thead><tbody></tbody></table>
+      <div class="box-note" id="fc-cal-note"></div></div>
+    <div class="box"><div class="box-title">▶ FORECAST JOURNAL · last 15 days · resolved HIT/MISS after the horizon</div>
+      <table class="tbl" id="fc-jrn"><thead><tr><th>Date</th><th>Regime that day</th><th>Predicted next</th><th>Prob</th><th>Actual</th><th>Status</th></tr></thead><tbody></tbody></table></div>
     <div class="box"><div class="box-title">▶ EMPIRICAL TRANSITION MATRIX · P(next-day regime | today) % · full history</div>
       <div style="overflow-x:auto"><table class="mtx" id="mtx"></table></div>
-      <div class="box-note">Counts of day→next-day regime changes over the full sample, row-normalised. Diagonal = persistence.</div></div>
-    <div class="box"><div class="box-title" id="fc-title"></div><div id="fc-bars"></div>
-      <div class="box-note">Markov projection = current-regime row of the transition matrix raised to the horizon power. Assumes history repeats and transitions are memoryless — a descriptive baseline, not a prediction.</div></div>
+      <div class="box-note">Descriptive only — day→next-day transition counts, row-normalised. The forecast above uses the 5-day streak-adjusted model, not this 1-day matrix.</div></div>
   </div>
 
   <div class="panel" data-panel="help">
@@ -1010,6 +1123,7 @@ function lineChart(series, opts){
   return `<svg viewBox="0 0 ${w} ${h}" class="chart" preserveAspectRatio="none" font-family="var(--mono)">${g}${xl}${paths}</svg>`;
 }
 function legend(series){return series.map(s=>`<span class="lg"><span class="sw" style="background:${cv(s.color)}"></span>${s.name}</span>`).join("");}
+function REG_COLOR_JS(name){const o=DATA.regime.order,i=o.indexOf(name);return i<0?"--ink":DATA.regime.colors[i];}
 
 /* ---- term-structure snapshot ---- */
 function svgTermSnap(){
@@ -1228,13 +1342,29 @@ function render(){
   let mh2="<tr><th class='k'>from \\ to</th>"+DATA.regime.order.map((l,i)=>`<th><span style="color:${cv(DATA.regime.colors[i])}">${l.split(" ")[0]}</span></th>`).join("")+"</tr>";
   T.forEach((row,i)=>{mh2+=`<tr><td class="k"><span style="color:${cv(DATA.regime.colors[i])}">■</span> ${DATA.regime.order[i]}</td>`+row.map((p,j)=>`<td class="c" style="background:rgba(61,220,132,${p==null?0:(p/100*0.8).toFixed(2)})">${p==null?"—":p}</td>`).join("")+"</tr>";});
   el("mtx").innerHTML=mh2;
-  el("fc-title").textContent=`▶ FORECAST · regime distribution ${DATA.regime.horizon} trading days out (from ${reg.label})`;
-  el("fc-bars").innerHTML=DATA.regime.order.map((l,i)=>{const p=DATA.regime.forecast_h[i]||0;return `<div class="fcbar"><span class="fk" data-tip="${REGTIP[l]||""}"><span style="color:${cv(DATA.regime.colors[i])}">■</span> ${l}</span><span class="track"><span class="fill" style="width:${p}%;background:${cv(DATA.regime.colors[i])}"></span></span><span class="fv">${p}%</span></div>`;}).join("");
+
+  /* FORECAST (streak-adjusted persistence, 5-day) + calibration */
+  const F=DATA.forecast;
+  el("fc-head").textContent=`▶ REGIME FORECAST · next ${F.horizon} trading days`;
+  el("fc-sub").textContent=`From today's regime (${reg.label}). Evidence-based next-regime probabilities — does not forecast SPX direction, VIX level, returns or trade profitability.`;
+  const conf=F.top_prob, risk=conf>=60?"LOW":conf>=45?"MODERATE":"HIGH";
+  el("fc-cards").innerHTML=[
+    ["MOST LIKELY NEXT",`<span style="color:${cv(REG_COLOR_JS(F.top))}">${F.top}</span> · ${F.top_prob}%`],
+    ["SECOND",`${F.second} · ${F.second_prob}%`],
+    ["TRANSITION RISK",`${risk} (top ${F.top_prob}% vs 2nd ${F.second_prob}%)`]
+  ].map(([k,v])=>`<div class="reg-cell"><div class="rk">${k}</div><div class="rv">${v}</div></div>`).join("");
+  el("fc-title").textContent=`▶ NEXT-REGIME PROBABILITY · ${F.horizon} trading days out`;
+  el("fc-bars").innerHTML=F.order.map((l,i)=>{const p=F.dist[i]||0;return `<div class="fcbar"><span class="fk" data-tip="${REGTIP[l]||""}"><span style="color:${cv(F.colors[i])}">■</span> ${l}</span><span class="track"><span class="fill" style="width:${p}%;background:${cv(F.colors[i])}"></span></span><span class="fv">${num(p,1)}%</span></div>`;}).join("");
+  const cal=F.calib;
+  el("fc-cal-title").textContent=`▶ FORECAST RELIABILITY · retroactive causal backtest · ${cal.n.toLocaleString("en-US")} daily forecasts since ${F.cal_from}`;
+  el("fc-cal").querySelector("tbody").innerHTML=cal.buckets.map(b=>`<tr><td>${b.bucket}</td><td>${b.n}</td><td>${b.conf==null?"—":b.conf+"%"}</td><td>${b.acc==null?"—":b.acc+"%"}</td><td class="${b.err==null?"":(b.err<0?"bad":"good")}">${b.err==null?"—":(b.err>0?"+":"")+b.err+" pp"}</td></tr>`).join("");
+  el("fc-cal-note").innerHTML=`Each day's forecast is re-derived from data up to that day, then marked HIT/MISS after ${F.horizon} trading days. This is a <b>simulated causal replay, not a live journal</b> — identical for everyone, regenerated each build. Overall: avg confidence ${cal.overall_conf}%, actual ${cal.overall_acc}% → <b class="${cal.bias_pp<0?'bad':'good'}">${cal.bias} (${cal.bias_pp>0?"+":""}${cal.bias_pp} pp)</b>. Quality ${cal.quality}/100. Bucket errors are shown, not hidden — that is what the curve is for.`;
+  el("fc-jrn").querySelector("tbody").innerHTML=F.journal.map(j=>`<tr><td>${j.date}</td><td><span style="color:${cv(REG_COLOR_JS(j.regime))}">${j.regime}</span></td><td>${j.pred}</td><td>${j.prob}%</td><td>${j.actual||"—"}</td><td class="${j.status==='HIT'?'good':j.status==='MISS'?'bad':''}">${j.status}</td></tr>`).join("");
 
   /* SETTINGS */
   el("set-src").innerHTML=DATA.sources.map(s=>
     `<div class="row"><span class="rk">${s.name}</span><span class="rv">${s.ticker} · last ${s.last} · <span class="${s.ok?"chk":"chx"}">${s.ok?"✓ fresh":"✗ stale ("+s.lag+" sessions)"}</span>${s.filled?` · <span class="chx" title="interior gaps carried forward (ffill)">⚠ ${s.filled} filled</span>`:""}</span></div>`).join("");
-  el("set-par").innerHTML=[["History start",DATA.first],["As of",DATA.asof],["Total sessions",DATA.n_total],["DTE horizons",DATA.dtes.join(" / ")],["Lookbacks",Object.values(DATA.lookbacks).map(l=>l.name).join(" · ")],["Term nodes (days)",Object.entries(DATA.node_days).map(([k,v])=>k+"="+v).join(" · ")],["Forecast horizon",DATA.regime.horizon+" trading days"]].map(([k,x])=>`<div class="row"><span class="rk">${k}</span><span class="rv">${x}</span></div>`).join("");
+  el("set-par").innerHTML=[["History start",DATA.first],["As of",DATA.asof],["Total sessions",DATA.n_total],["DTE horizons",DATA.dtes.join(" / ")],["Lookbacks",Object.values(DATA.lookbacks).map(l=>l.name).join(" · ")],["Term nodes (days)",Object.entries(DATA.node_days).map(([k,v])=>k+"="+v).join(" · ")],["Forecast horizon",DATA.forecast.horizon+" trading days (streak-adjusted persistence)"]].map(([k,x])=>`<div class="row"><span class="rk">${k}</span><span class="rv">${x}</span></div>`).join("");
   el("set-w").innerHTML=Object.entries(DATA.weights).map(([k,x])=>`<div class="row"><span class="rk">${k.toUpperCase()}</span><span class="rv">${x}%</span></div>`).join("");
   el("set-subs").innerHTML=`<b style="color:var(--ink-dim)">RICH</b> — richness: percentile of current VRP within this DTE's own trailing history (rich IV vs its norm).<br><b style="color:var(--ink-dim)">CARRY</b> — carry per day: VRP ÷ calendar days, ranked across the DTE set (which tenor pays most premium per day now, relative).<br><b style="color:var(--ink-dim)">SAFETY</b> — merged reliability (info ratio = mean ÷ std of forward VRP) + tail-safety (1 − |CVaR₅|). These two were measured to be redundant (Spearman +0.89 on the real definitions, 2026-08-26), so they are one axis to avoid double-counting.<br><b style="color:var(--ink-dim)">PATH</b> — path-safety: trailing mean Max Adverse Excursion of the SPX price path over the forward window, inverted percentile within its own window history. A genuine <i>path</i> axis (the price journey), distinct from SAFETY's VRP-outcome tail.<br><b style="color:var(--ink-dim)">STAB</b> — stability: steadiness of recent VRP vs its window dispersion.<br>Five decorrelated axes — level, cross-sectional carry, outcome safety, path safety, steadiness — so the composite doesn't double-count. <b>Note:</b> the composite ranks premium <i>quality/safety</i>, not expected P&L — measured (2026-08-26) low-vol conditions precede weaker short-vol returns (complacency).`;
   el("set-rules").innerHTML=`VIX≥40 → <code>VOL SHOCK</code> · VIX≥28 or slope&lt;0.97 → <code>STRESS / BACKW</code> · VIX≥20 → <code>TRANSITION</code> · slope≥1.05 &amp; uptrend &amp; VIX&lt;17 → <code>CALM CARRY</code> · slope≥1.0 &amp; uptrend → <code>STEADY CARRY</code> · else → <code>NEUTRAL RANGE</code>.<br>slope = VIX3M / VIX (&gt;1 contango). uptrend = SPX &gt; 200-day moving average.`;
