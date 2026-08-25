@@ -963,10 +963,10 @@ TEMPLATE = r"""<meta charset="utf-8">
     <button class="tab" data-tab="matrix" data-tip="Monthly average VRP per DTE — 24-month heatmap.">VRP MATRIX</button>
     <button class="tab" data-tab="charts" data-tip="IV vs realized vol, VRP by DTE, VIX term-structure history.">CHARTS</button>
     <button class="tab" data-tab="regime" data-tip="Current regime diagnostics + per-regime forward-VRP evidence.">REGIME ANALYSIS</button>
-    <button class="tab" data-tab="validation" data-tip="Does the VRP signal carry forward information? Quintile test + equity proxy.">VALIDATION</button>
+    <button class="tab" data-tab="validation" data-tip="Does the VRP signal carry forward information? Quintile test + equity proxy + analog engine (k-NN over state).">VALIDATION</button>
     <button class="tab" data-tab="backtest" data-tip="Black-Scholes-reconstructed option structures over ~15 years, with skew & regime-gate toggles.">BACKTEST</button>
     <button class="tab" data-tab="timeline" data-tip="Rule-based regime label for every session, as a colored ribbon.">REGIME TIMELINE</button>
-    <button class="tab" data-tab="forecast" data-tip="Empirical Markov transition matrix — descriptive baseline, not a prediction.">REGIME FORECAST</button>
+    <button class="tab" data-tab="forecast" data-tip="Streak-adjusted persistence forecast (5 trading days) + retroactive self-calibration. Regime-state estimate, not a market prediction.">REGIME FORECAST</button>
     <button class="tab" data-tab="help" data-tip="How to read every number, derive trade inputs, size from the tail — and the red flags.">HELP</button>
     <button class="tab" data-tab="settings" data-tip="Data sources, parameters, composite weights, sub-score definitions, regime rules.">SETTINGS</button>
     <button class="tab export" data-tab="export" data-tip="Print or save the report as PDF.">EXPORT PDF</button>
@@ -1113,9 +1113,12 @@ TEMPLATE = r"""<meta charset="utf-8">
         <tr><td>VRP PCT</td><td>Richness vs its own history</td><td>≥ 60th = rich · ≤ 30th = thin, patience is a position</td></tr>
         <tr><td>HIT RATE</td><td>How often selling won historically</td><td class="warn">~80% is NORMAL here — never read it as safety; losses are far larger than wins</td></tr>
         <tr><td>WORST / p5</td><td>Size of the left tail</td><td class="bad">THE critical number — position sizing derives from it (next box)</td></tr>
-        <tr><td>COMPOSITE</td><td>Relative attractiveness across DTEs</td><td>A ranking, not a signal — read <i>why</i> via the five bars</td></tr>
+        <tr><td>COMPOSITE</td><td>Premium quality/safety across DTEs</td><td>A ranking of <i>safety</i>, NOT expected P&amp;L — measured, calm conditions precede weaker short-vol returns (complacency). Read <i>why</i> via the five bars</td></tr>
         <tr><td>Slope VIX3M/VIX</td><td>Term-structure state</td><td>≥ 1 contango = carry-friendly · &lt; 0.97 backwardation = stress dynamics</td></tr>
         <tr><td>Validation quintiles</td><td>Does a richer signal pay more forward?</td><td>Rising Q1→Q5 = the signal carries real information</td></tr>
+        <tr><td>RV COMPOSITE</td><td>rv10 − rv63: realized vol accelerating?</td><td class="warn">&gt; 0 in CALM/STEADY = measured drag on short vol (Ticket 02). No signal in TRANSITION (sign flips)</td></tr>
+        <tr><td>Forecast reliability</td><td>Is the regime forecast well-calibrated?</td><td>Confidence vs actual accuracy per bucket; the tool shows its own bias openly (retroactive replay)</td></tr>
+        <tr><td>Analog engine</td><td>What followed similar historical states?</td><td>Context, not alpha — measured fwd-RV skill only; return prediction ≈ 0</td></tr>
         <tr><td>Regime</td><td>Which historical playbook applies</td><td class="bad">NEUTRAL RANGE is the only regime where short vol lost on average (<span id="h-nr"></span>)</td></tr>
       </tbody></table></div>
 

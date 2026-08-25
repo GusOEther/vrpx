@@ -49,6 +49,8 @@ A GitHub Action (`.github/workflows/build.yml`) rebuilds the report every weekda
 
 The dashboard concept and visual language pay homage to **Tomas Byron's "VRPX PRO"** — [homepage (ATM Options Edge)](https://atmoptionsedge.ch/) · [YouTube channel](https://www.youtube.com/@tombyr4907) · [the original walkthrough video](https://www.youtube.com/watch?v=cHPew0fKbgQ). This is an independent rebuild: free public data only, and all scoring/regime/backtest logic is our own and fully disclosed in the Settings tab.
 
+Some feature *ideas* were prompted by that public walkthrough (an analog/k-NN engine, a regime forecast with self-calibration, a path-risk score). The implementation and **every parameter** here were derived and validated independently against our own measurements — nothing was copied. Where a measurement did not support an idea (e.g. a nine-state behavioural taxonomy, a weighted forecast ensemble, a per-strategy weighting lens), it was left out on purpose.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
