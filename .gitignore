@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 vrpx_report.html
 dist/
+.scratch/
