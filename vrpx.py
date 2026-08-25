@@ -264,6 +264,27 @@ def regime_block(px, labels, slope, up, vrp_hist30, vrp_now30):
                         avg_vrp=jnum(vals.mean(), 2) if len(vals) else None,
                         hit=jnum((vals > 0).mean() * 100, 0) if len(vals) else None)
 
+    # per-regime, per-lookback (window) stats with a hard min-n gate. Below MIN_REG_N
+    # eligible observations a cell reads "insufficient" rather than a misleading number.
+    MIN_REG_N = 60
+    per_lb = {}
+    for N in LOOKBACKS:
+        if N > len(labels):
+            continue
+        wl = labels.iloc[-N:]
+        cell = {}
+        for lab in REG_ORDER:
+            m = (wl == lab)
+            vals = vh[m.reindex(vh.index, fill_value=False)].dropna()
+            days = int(m.sum())
+            if len(vals) >= MIN_REG_N:
+                cell[lab] = dict(days=days, n=int(len(vals)),
+                                 avg_vrp=jnum(vals.mean(), 2),
+                                 hit=jnum((vals > 0).mean() * 100, 0), ok=True)
+            else:
+                cell[lab] = dict(days=days, n=int(len(vals)), avg_vrp=None, hit=None, ok=False)
+        per_lb[str(N)] = cell
+
     # transition matrix + forecast
     M, P = transition_matrix(labels)
     Ph = np.linalg.matrix_power(P, FORECAST_H)
@@ -293,7 +314,7 @@ def regime_block(px, labels, slope, up, vrp_hist30, vrp_now30):
                      reg_days=per[cur]["days"], rv_acc=jnum(rv_acc, 2), rv_calm=bool(rv_acc <= 1.05),
                      rvc=jnum(rvc, 2), rvc_accel=bool(rvc > 0)),
         order=REG_ORDER, colors=[REG_COLOR[l] for l in REG_ORDER],
-        per_regime=per,
+        per_regime=per, per_regime_lb=per_lb, min_reg_n=MIN_REG_N,
         transition=[[jnum(P[i, j] * 100, 0) for j in range(len(REG_ORDER))] for i in range(len(REG_ORDER))],
         counts=[int((labels == l).sum()) for l in REG_ORDER],
         forecast_1=[jnum(x * 100, 0) for x in fc_1],
@@ -1000,9 +1021,9 @@ TEMPLATE = r"""<meta charset="utf-8">
 
   <div class="panel" data-panel="regime">
     <div class="box"><div class="box-title">▶ CURRENT REGIME</div><div class="reg-grid" id="reg-grid"></div></div>
-    <div class="box"><div class="box-title">▶ PER-REGIME EVIDENCE · forward VRP-30 · full history</div>
-      <table class="tbl" id="reg-tbl"><thead><tr><th>Regime</th><th>Days</th><th>Share</th><th>Avg fwd VRP</th><th>Hit rate</th></tr></thead><tbody></tbody></table>
-      <div class="box-note">"Avg fwd VRP" = mean of IV − subsequent realized vol on days in that regime. Descriptive of history, not a forecast.</div></div>
+    <div class="box"><div class="box-title" id="reg-tbl-title"></div>
+      <table class="tbl" id="reg-tbl"><thead><tr><th>Regime</th><th>Days (full)</th><th>Avg VRP (full)</th><th>Hit (full)</th><th>Avg VRP (window)</th><th>Hit (window)</th></tr></thead><tbody></tbody></table>
+      <div class="box-note" id="reg-tbl-note"></div></div>
   </div>
 
   <div class="panel" data-panel="validation">
@@ -1394,8 +1415,13 @@ function render(){
   /* REGIME ANALYSIS */
   const rvcTxt=(reg.rvc>=0?"+":"")+reg.rvc+(reg.rvc_accel?" ⚠ accel":" (calm)");
   el("reg-grid").innerHTML=[["REGIME",reg.label],["VIX3M/VIX SLOPE",reg.slope+" ("+reg.slope_txt+")"],["VIX",reg.vix+"  ("+ord(reg.vix_pct)+" pct)"],["RV COMPOSITE (rv10−rv63)",rvcTxt],["SPX STATE",reg.spx_state],["20-DAY RETURN",(reg.ret20>=0?"+":"")+reg.ret20+"%"]].map(([k,v])=>`<div class="reg-cell" data-tip="${k.indexOf('RV COMPOSITE')===0?'rv10 − rv63 in vol points: >0 = realized vol accelerating vs its quarter norm. In CALM/STEADY this measurably drags short-vol P&L (Ticket 02).':''}"><div class="rk">${k}</div><div class="rv">${v}</div></div>`).join("");
-  const per=DATA.regime.per_regime;
-  el("reg-tbl").querySelector("tbody").innerHTML=DATA.regime.order.map((l,i)=>{const p=per[l];return `<tr><td data-tip="${REGTIP[l]||""}"><span style="color:${cv(DATA.regime.colors[i])}">■</span> ${l}</td><td>${p.days}</td><td>${num(p.share,1)}%</td><td>${num(p.avg_vrp,2)}</td><td>${num(p.hit,0)}%</td></tr>`;}).join("");
+  const per=DATA.regime.per_regime, perW=(DATA.regime.per_regime_lb||{})[state.lb]||{};
+  el("reg-tbl-title").textContent=`▶ PER-REGIME EVIDENCE · forward VRP-30 · full history vs selected window (${N} sessions)`;
+  el("reg-tbl").querySelector("tbody").innerHTML=DATA.regime.order.map((l,i)=>{const p=per[l],w=perW[l]||{};
+    const wcell=w.ok?`${num(w.avg_vrp,2)}`:`<span class="dim" title="only ${w.n||0} obs, below the ${DATA.regime.min_reg_n}-obs minimum">insufficient (n=${w.n||0})</span>`;
+    const whit=w.ok?`${num(w.hit,0)}%`:`—`;
+    return `<tr><td data-tip="${REGTIP[l]||""}"><span style="color:${cv(DATA.regime.colors[i])}">■</span> ${l}</td><td>${p.days} (${num(p.share,1)}%)</td><td>${num(p.avg_vrp,2)}</td><td>${num(p.hit,0)}%</td><td>${wcell}</td><td>${whit}</td></tr>`;}).join("");
+  el("reg-tbl-note").innerHTML=`"Avg VRP" = mean of IV − subsequent realized vol on days in that regime. <b>Full</b> = whole history (stable reference). <b>Window</b> = the selected lookback, gated at a hard ${DATA.regime.min_reg_n}-observation minimum — below it a cell reads <i>insufficient</i> rather than a misleading number (forward RV overlaps ~21×, so small windows have very few independent observations). Descriptive of history, not a forecast.`;
 
   /* VALIDATION */
   const v=DATA.validation;
