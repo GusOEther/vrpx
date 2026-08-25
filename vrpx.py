@@ -429,6 +429,76 @@ def validation_block(vrp_now30, vrp_hist30):
 
 
 # --------------------------------------------------------------------------- #
+# analog engine (k-NN over the vol/term/price state) — Ticket 03
+#   5-dim vector, causal percentile-rank normalisation, k=120, full history.
+#   Measured fwd-RV21 Spearman ~0.60 vs 0.55 baseline; return prediction ~0 -> context,
+#   not alpha. Neighbours restricted to days with a complete forward window.
+# --------------------------------------------------------------------------- #
+ANALOG_K = 120
+ANALOG_HORIZONS = [7, 14, 21, 30]
+
+def analog_block(px, labels):
+    p = px["SPX"]
+    r = np.log(p / p.shift(1))
+    ann = math.sqrt(TRADING_YR) * 100
+    feats = pd.DataFrame({
+        "vix":  px["^VIX"],
+        "v9v":  px["^VIX9D"] / px["^VIX"],
+        "vv3m": px["^VIX"] / px["^VIX3M"].fillna(px["^VIX"]),
+        "rvc":  (r.rolling(10).std() - r.rolling(63).std()) * ann,
+        "er21": (p - p.shift(21)).abs() / p.diff().abs().rolling(21).sum(),
+    }).dropna()
+    # causal percentile-rank normalisation (expanding). For today's query the final
+    # expanding state == full-history rank, which is correct for the last row.
+    Z = feats.rank(pct=True).to_numpy()
+    idx = feats.index
+    n = len(idx)
+    maxh = max(ANALOG_HORIZONS)
+    q = Z[-1]
+    # eligible neighbours: complete forward window, exclude the last maxh rows and today
+    elig = np.arange(0, n - maxh)
+    d = np.linalg.norm(Z[elig] - q, axis=1)
+    order = elig[np.argsort(d)][:ANALOG_K]
+    dd = np.linalg.norm(Z[order] - q, axis=1)
+    sim = 1.0 / (1.0 + dd)                       # display transform only
+    sim = (sim - sim.min()) / (sim.max() - sim.min()) if sim.max() > sim.min() else sim
+
+    P = p.reindex(idx).to_numpy()
+    VIX = px["^VIX"].reindex(idx).to_numpy()
+    lab = labels.reindex(idx).to_numpy()
+    rv21_fwd = (r.rolling(21).std().shift(-21) * ann).reindex(idx).to_numpy()
+
+    per_h = []
+    for h in ANALOG_HORIZONS:
+        rets = np.array([P[s + h] / P[s] - 1 for s in order]) * 100
+        per_h.append(dict(h=h, matches=len(order),
+                          avg=jnum(np.nanmean(rets), 2), med=jnum(np.nanmedian(rets), 2),
+                          worst=jnum(np.nanmin(rets), 1), best=jnum(np.nanmax(rets), 1),
+                          pos=jnum((rets > 0).mean() * 100, 0)))
+    fwd_rv = np.array([rv21_fwd[s] for s in order])
+    vix_chg = np.array([VIX[s + 21] - VIX[s] for s in order])
+
+    top = []
+    for j in np.argsort(dd)[:12]:
+        s = order[j]
+        top.append(dict(date=idx[s].strftime("%Y-%m-%d"), regime=lab[s],
+                        dist=jnum(float(dd[j]), 3), sim=jnum(float(sim[j]) * 100, 0),
+                        vix=jnum(float(VIX[s]), 1),
+                        ret21=jnum(float(P[s + 21] / P[s] - 1) * 100, 1),
+                        fwd_rv=jnum(float(rv21_fwd[s]), 1)))
+
+    return dict(k=ANALOG_K, n_eligible=int(len(elig)),
+                window_from=idx[0].strftime("%d %b %Y"), window_to=idx[-1].strftime("%d %b %Y"),
+                per_h=per_h, avg_fwd_rv=jnum(float(np.nanmean(fwd_rv)), 1),
+                avg_vix_chg=jnum(float(np.nanmean(vix_chg)), 1), top=top,
+                cur=dict(vix=jnum(float(feats["vix"].iloc[-1]), 1),
+                         v9v=jnum(float(feats["v9v"].iloc[-1]), 3),
+                         vv3m=jnum(float(feats["vv3m"].iloc[-1]), 3),
+                         rvc=jnum(float(feats["rvc"].iloc[-1]), 2),
+                         er21=jnum(float(feats["er21"].iloc[-1]), 2)))
+
+
+# --------------------------------------------------------------------------- #
 # VRP matrix: monthly nowcast VRP by DTE (last 24 months)
 # --------------------------------------------------------------------------- #
 def vrp_matrix_block(series):
@@ -686,6 +756,7 @@ def build_data(px):
         charts=ch,
         regime=regime_block(px, labels, slope, up, series[30]["vrp_hist"], series[30]["vrp_now"]),
         forecast=forecast_block(px, labels),
+        analog=analog_block(px, labels),
         validation=validation_block(series[30]["vrp_now"], series[30]["vrp_hist"]),
         backtest=backtest_block(px, series[30]["iv"], labels, series[30]["vrp_now"], rate),
         matrix=vrp_matrix_block(series),
@@ -944,6 +1015,16 @@ TEMPLATE = r"""<meta charset="utf-8">
       <div class="box"><div class="box-title">▶ SUMMARY (full history)</div><div class="kvlist" id="val-sum"></div></div>
       <div class="box"><div class="box-title">▶ READING IT</div><div class="box-note" style="font-size:11.5px">A monotone rise in "Avg forward VRP" across quintiles means the current-VRP signal has genuine forward information: when IV looks rich vs recent realized, subsequent captured premium is higher. A flat/noisy pattern means little edge.</div></div>
     </div>
+
+    <div class="box"><div class="box-title" id="an-title"></div>
+      <div class="box-note" style="margin-top:0" id="an-sub"></div>
+      <div class="reg-grid" id="an-state" style="margin-top:10px"></div></div>
+    <div class="box"><div class="box-title">▶ HISTORICAL MATCHES · what followed the analog days · by horizon</div>
+      <table class="tbl" id="an-h"><thead><tr><th>Horizon</th><th>Matches</th><th>Avg SPX return</th><th>Median</th><th>Worst</th><th>Best</th><th>Positive %</th></tr></thead><tbody></tbody></table>
+      <div class="box-note" id="an-h-note"></div></div>
+    <div class="box"><div class="box-title">▶ TOP ANALOG DAYS · nearest neighbours in state space</div>
+      <table class="tbl" id="an-top"><thead><tr><th>Date</th><th>Regime</th><th>Distance</th><th>Similarity</th><th>VIX</th><th>21d SPX ret</th><th>21d fwd RV</th></tr></thead><tbody></tbody></table>
+      <div class="box-note">Similarity is a display transform of distance, <b>not a probability</b>. Neighbours use only observable state (VIX level, term structure, RV composite, 21-day efficiency) and are restricted to days with a complete forward window.</div></div>
   </div>
 
   <div class="panel" data-panel="backtest">
@@ -1325,6 +1406,15 @@ function render(){
   el("eq-title").textContent=`▶ CUMULATIVE CAPTURED VRP-30 (equity proxy) · last ${N} sessions`;
   el("chart-eq").innerHTML=lineChart([{name:"cum VRP",color:"--green",data:eqser}],{dates:dts,zero:true,area:true});
   el("val-sum").innerHTML=[["Mean forward VRP",num(v.mean,2)],["Std",num(v.std,2)],["Info ratio (mean/std)",num(v.info_ratio,2)],["Hit rate",num(v.hit,0)+"%"],["Best / Worst",num(v.best,1)+" / "+num(v.worst,1)],["Sample size",v.n+" days"],["Window max drawdown",num(mdd,1)]].map(([k,x])=>`<div class="row"><span class="rk">${k}</span><span class="rv">${x}</span></div>`).join("");
+
+  /* ANALOG ENGINE */
+  const an=DATA.analog;
+  el("an-title").textContent=`▶ ANALOG ENGINE · ${an.k} nearest historical days · full history (fixed — does not follow the lookback buttons)`;
+  el("an-sub").textContent=`Window ${an.window_from} – ${an.window_to} · ${an.n_eligible.toLocaleString("en-US")} eligible days. Measured skill: fwd-RV Spearman ≈0.60 vs 0.55 baseline; return prediction ≈0 → context, not alpha.`;
+  el("an-state").innerHTML=[["VIX",an.cur.vix],["VIX9D/VIX",an.cur.v9v],["VIX/VIX3M",an.cur.vv3m],["RV COMPOSITE",an.cur.rvc],["21d EFFICIENCY",an.cur.er21]].map(([k,x])=>`<div class="reg-cell"><div class="rk">${k}</div><div class="rv">${x}</div></div>`).join("");
+  el("an-h").querySelector("tbody").innerHTML=an.per_h.map(h=>`<tr><td>${h.h}d</td><td>${h.matches}</td><td class="${h.avg>=0?'good':'bad'}">${num(h.avg,2)}%</td><td>${num(h.med,2)}%</td><td class="bad">${num(h.worst,1)}%</td><td class="good">${num(h.best,1)}%</td><td>${num(h.pos,0)}%</td></tr>`).join("");
+  el("an-h-note").innerHTML=`Across the ${an.k} nearest analogs: average forward realized vol ${an.avg_fwd_rv}%, average 21-day VIX change ${an.avg_vix_chg>=0?"+":""}${an.avg_vix_chg}. Forward outcomes are historical analogs, <b>not forecasts</b>.`;
+  el("an-top").querySelector("tbody").innerHTML=an.top.map(t=>`<tr><td>${t.date}</td><td><span style="color:${cv(REG_COLOR_JS(t.regime))}">${t.regime}</span></td><td>${t.dist}</td><td>${t.sim}%</td><td>${t.vix}</td><td class="${t.ret21>=0?'good':'bad'}">${num(t.ret21,1)}%</td><td>${num(t.fwd_rv,1)}%</td></tr>`).join("");
 
   /* BACKTEST */
   renderBacktest();
