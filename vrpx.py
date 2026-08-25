@@ -56,10 +56,15 @@ CALM_REGIMES = {"CALM CARRY", "STEADY CARRY"}
 # Composite weights over 5 INDEPENDENT axes (our definition, editable). Sum = 1.0
 #   rich   = richness   : percentile of current VRP within the DTE's own history
 #   carry  = carry/day  : VRP per calendar day, ranked across the DTE set (relative)
-#   reliab = reliability: info ratio (mean/std of forward VRP) of this DTE's window
-#   tail   = tail-safety: 1 - |CVaR5| of forward VRP (how bad the worst 5% is)
+#   safety = reliability+tail-safety, MERGED: the old RELIAB (info ratio) and TAIL
+#            (1-|CVaR5|) axes measure the same thing — Spearman +0.885 on the real
+#            definitions (measured 2026-08-26) — so they are one axis, not two, to
+#            avoid double-counting. safety = mean of both 0-100 sub-scores.
+#   path   = path-safety: cross-sectional rank of trailing mean Max-Adverse-Excursion
+#            of the SPX path over the forward window (mild path now = high score). A
+#            genuine PATH axis (the price journey), distinct from tail (VRP outcome).
 #   stab   = stability  : steadiness of recent VRP vs its window dispersion
-W = {"rich": 0.30, "carry": 0.15, "reliab": 0.25, "tail": 0.20, "stab": 0.10}
+W = {"rich": 0.30, "carry": 0.15, "safety": 0.35, "path": 0.10, "stab": 0.10}
 CARD_COLORS = ["--pink", "--yellow", "--blue", "--green"]
 
 REG_ORDER = ["CALM CARRY", "STEADY CARRY", "NEUTRAL RANGE",
@@ -103,8 +108,16 @@ def load():
         src.append(dict(name=name, ticker=col if col != "SPX" else "^GSPC",
                         last=s.index[-1].strftime("%d %b %Y") if len(s) else "—",
                         lag=lag, ok=bool(lag <= 3)))
+    # close interior gaps (Cboe drops the odd day) via ffill; COUNT how many rows were
+    # carried so the freshness layer can flag the series as degraded rather than pretend.
+    fill_counts = {}
     for c in ["^VIX", "^VIX9D", "^VIX3M", "^VIX6M"]:
+        s = px[c]
+        interior = s.loc[s.first_valid_index():].isna().sum() if s.first_valid_index() is not None else 0
+        fill_counts[c] = int(interior)
         px[c] = px[c].ffill(limit=3)
+    for s in src:
+        s["filled"] = fill_counts.get(s["ticker"], 0)
     px = px.dropna(subset=["SPX", "^VIX", "^VIX9D"])
     px.attrs["sources"] = src
     return px
@@ -137,17 +150,29 @@ def rv_trailing(px, dte):
 # --------------------------------------------------------------------------- #
 # per-DTE series & cards
 # --------------------------------------------------------------------------- #
+def mae_series(px, dte):
+    """Max Adverse Excursion (%) of the SPX path over the forward window, per entry day.
+    Resolved (shift by horizon) so the value is causally available. For a short-vol
+    position the adverse move is large in either direction."""
+    n = trading_days(dte)
+    p = px["SPX"]
+    hi = p.rolling(n).max().shift(-n)
+    lo = p.rolling(n).min().shift(-n)
+    mae = np.maximum(hi / p - 1.0, 1.0 - lo / p) * 100.0
+    return mae.shift(n)                      # causal: known only n days later
+
 def dte_series(px, dte):
     iv  = iv_series(px, dte)
     rvf = rv_forward(px, dte)
     rvt = rv_trailing(px, dte)
     vrp_hist = iv - rvf                      # forward outcome (for stats)
     vrp_now  = iv - rvt                      # nowcast (no forward yet)
+    mae = mae_series(px, dte)                # causal path risk
     rv_acc = (rvt.iloc[-1] / rvt.iloc[-22]) if not np.isnan(rvt.iloc[-22]) and rvt.iloc[-22] else 1.0
     gamma  = float(np.clip(100 * (1 - (rv_acc - 1)), 0, 100))
     return dict(dte=dte, iv=iv, rvt=rvt, cur_iv=float(iv.iloc[-1]),
                 cur_vrp=float(vrp_now.iloc[-1]), vrp_hist=vrp_hist,
-                vrp_now=vrp_now, gamma=gamma)
+                vrp_now=vrp_now, mae=mae, gamma=gamma)
 
 def cards_for(series, N):
     """Compute all DTE cards for a lookback together (needed for cross-sectional carry)."""
@@ -163,8 +188,14 @@ def cards_for(series, N):
         cvar = float(np.nanmean(tailv)) if len(tailv) else np.nan
         recent = ds["vrp_now"].dropna().tail(21).std()
         stab = 100 * (1 - min(recent / sd, 1)) if sd and sd > 0 else 50.0
+        # PATH: self-relative percentile of the recent path risk vs this DTE's own
+        # window history (cross-sectional MAE is trivially monotone in horizon, so it
+        # would only measure window length — the percentile normalises that away).
+        mwin = ds["mae"].dropna().tail(N).to_numpy()
+        recent_mae = float(np.nanmean(mwin[-21:])) if len(mwin) else np.nan
+        path = (100 - pct_rank(mwin, recent_mae)) if len(mwin) and not np.isnan(recent_mae) else 50.0
         raw[d] = dict(cur_iv=ds["cur_iv"], cur_vrp=cur, rich=pct_rank(win, cur), ir=ir,
-                      cvar=cvar, stab=stab, carry_pd=cur / d,
+                      cvar=cvar, stab=stab, carry_pd=cur / d, path=path,
                       hit=float((win > 0).mean() * 100) if len(win) else np.nan,
                       worst=float(np.nanmin(win)) if len(win) else np.nan)
     cps = [raw[d]["carry_pd"] for d in DTES]
@@ -176,7 +207,9 @@ def cards_for(series, N):
         carry  = 100 * (r["carry_pd"] - cmin) / rng if rng > 1e-9 else 50.0
         reliab = float(np.clip((0 if np.isnan(r["ir"]) else r["ir"]) / 0.8 * 100, 0, 100))
         tail   = float(np.clip(100 * (1 - abs(r["cvar"]) / 50), 0, 100)) if not np.isnan(r["cvar"]) else 50.0
-        subs = {"rich": r["rich"], "carry": carry, "reliab": reliab, "tail": tail, "stab": r["stab"]}
+        safety = (reliab + tail) / 2.0                       # merged axis (rho +0.885)
+        path   = r["path"]
+        subs = {"rich": r["rich"], "carry": carry, "safety": safety, "path": path, "stab": r["stab"]}
         comp = sum(W[k] * (0 if (subs[k] is None or np.isnan(subs[k])) else subs[k]) for k in W)
         cards.append(dict(dte=d, cur_iv=jnum(r["cur_iv"]), cur_vrp=jnum(r["cur_vrp"]),
                           vrp_pct=jnum(r["rich"]), hit=jnum(r["hit"]), worst=jnum(r["worst"]),
@@ -928,8 +961,8 @@ const el=id=>document.getElementById(id);
 const TIP={
   RICH:"Richness — percentile of the current VRP within this DTE's own trailing history. High = implied vol rich vs its own norm.",
   CARRY:"Carry per day — VRP ÷ calendar days, ranked across the four DTEs (min–max). Which tenor pays the most premium per day right now.",
-  RELIAB:"Reliability — info ratio (mean ÷ std of forward VRP over the lookback), mapped 0–100. Consistency of the edge, not its size.",
-  TAIL:"Tail-safety — from CVaR₅, the average of the worst 5% of historical episodes. Higher = milder left tail.",
+  SAFETY:"Safety — merged reliability (info ratio) + tail-safety (1−|CVaR₅|) of forward VRP. These two measured the same thing (Spearman +0.89) so they are one axis. Higher = consistent edge with a milder left tail.",
+  PATH:"Path-safety — trailing mean Max Adverse Excursion of the SPX path over the forward window, percentile of recent (21d) path risk within this DTE's own window history, inverted. High = the price path has been mild lately vs its norm (the path, not the VRP outcome).",
   STAB:"Stability — how steady recent VRP (21 sessions) is vs the whole window's dispersion. High = calm, predictable premium.",
   "CUR IV":"Implied vol for this DTE, interpolated from the VIX term structure (total-variance method). 7 DTE holds flat below the 9-day node.",
   "CUR VRP":"Nowcast VRP = current IV − trailing realized vol. Positive = options currently priced rich vs recent market movement.",
@@ -1007,7 +1040,7 @@ function cardHTML(c,rank,color,best,weak){
       ${mRow("HIT RATE",`<span class="mv">${num(c.hit,0,"%")}</span>`)}
       ${mRow("WORST",`<span class="mv neg">${num(c.worst,1,"%")}</span>`)}
       ${mRow("STABILITY",`<span class="mv">${num(s.stab,0)}/100</span>`)}</div>
-    <div class="bars">${barRow("RICH",s.rich)}${barRow("CARRY",s.carry)}${barRow("RELIAB",s.reliab)}${barRow("TAIL",s.tail)}${barRow("STAB",s.stab)}</div></div>`;
+    <div class="bars">${barRow("RICH",s.rich)}${barRow("CARRY",s.carry)}${barRow("SAFETY",s.safety)}${barRow("PATH",s.path)}${barRow("STAB",s.stab)}</div></div>`;
 }
 
 function slice(a,n){return a.slice(-n);}
@@ -1188,10 +1221,10 @@ function render(){
 
   /* SETTINGS */
   el("set-src").innerHTML=DATA.sources.map(s=>
-    `<div class="row"><span class="rk">${s.name}</span><span class="rv">${s.ticker} · last ${s.last} · <span class="${s.ok?"chk":"chx"}">${s.ok?"✓ fresh":"✗ stale ("+s.lag+" sessions)"}</span></span></div>`).join("");
+    `<div class="row"><span class="rk">${s.name}</span><span class="rv">${s.ticker} · last ${s.last} · <span class="${s.ok?"chk":"chx"}">${s.ok?"✓ fresh":"✗ stale ("+s.lag+" sessions)"}</span>${s.filled?` · <span class="chx" title="interior gaps carried forward (ffill)">⚠ ${s.filled} filled</span>`:""}</span></div>`).join("");
   el("set-par").innerHTML=[["History start",DATA.first],["As of",DATA.asof],["Total sessions",DATA.n_total],["DTE horizons",DATA.dtes.join(" / ")],["Lookbacks",Object.values(DATA.lookbacks).map(l=>l.name).join(" · ")],["Term nodes (days)",Object.entries(DATA.node_days).map(([k,v])=>k+"="+v).join(" · ")],["Forecast horizon",DATA.regime.horizon+" trading days"]].map(([k,x])=>`<div class="row"><span class="rk">${k}</span><span class="rv">${x}</span></div>`).join("");
   el("set-w").innerHTML=Object.entries(DATA.weights).map(([k,x])=>`<div class="row"><span class="rk">${k.toUpperCase()}</span><span class="rv">${x}%</span></div>`).join("");
-  el("set-subs").innerHTML=`<b style="color:var(--ink-dim)">RICH</b> — richness: percentile of current VRP within this DTE's own trailing history (rich IV vs its norm).<br><b style="color:var(--ink-dim)">CARRY</b> — carry per day: VRP ÷ calendar days, ranked across the DTE set (which tenor pays most premium per day now, relative).<br><b style="color:var(--ink-dim)">RELIAB</b> — reliability: info ratio = mean ÷ std of forward VRP over the window, mapped 0–100 (consistency of the edge).<br><b style="color:var(--ink-dim)">TAIL</b> — tail-safety: 1 − |CVaR₅| of forward VRP (higher = the worst 5% of episodes are less brutal).<br><b style="color:var(--ink-dim)">STAB</b> — stability: steadiness of recent VRP vs its window dispersion.<br>These are decorrelated by design — level, cross-sectional carry, consistency, tail risk, steadiness — so the composite doesn't double-count.`;
+  el("set-subs").innerHTML=`<b style="color:var(--ink-dim)">RICH</b> — richness: percentile of current VRP within this DTE's own trailing history (rich IV vs its norm).<br><b style="color:var(--ink-dim)">CARRY</b> — carry per day: VRP ÷ calendar days, ranked across the DTE set (which tenor pays most premium per day now, relative).<br><b style="color:var(--ink-dim)">SAFETY</b> — merged reliability (info ratio = mean ÷ std of forward VRP) + tail-safety (1 − |CVaR₅|). These two were measured to be redundant (Spearman +0.89 on the real definitions, 2026-08-26), so they are one axis to avoid double-counting.<br><b style="color:var(--ink-dim)">PATH</b> — path-safety: trailing mean Max Adverse Excursion of the SPX price path over the forward window, inverted percentile within its own window history. A genuine <i>path</i> axis (the price journey), distinct from SAFETY's VRP-outcome tail.<br><b style="color:var(--ink-dim)">STAB</b> — stability: steadiness of recent VRP vs its window dispersion.<br>Five decorrelated axes — level, cross-sectional carry, outcome safety, path safety, steadiness — so the composite doesn't double-count. <b>Note:</b> the composite ranks premium <i>quality/safety</i>, not expected P&L — measured (2026-08-26) low-vol conditions precede weaker short-vol returns (complacency).`;
   el("set-rules").innerHTML=`VIX≥40 → <code>VOL SHOCK</code> · VIX≥28 or slope&lt;0.97 → <code>STRESS / BACKW</code> · VIX≥20 → <code>TRANSITION</code> · slope≥1.05 &amp; uptrend &amp; VIX&lt;17 → <code>CALM CARRY</code> · slope≥1.0 &amp; uptrend → <code>STEADY CARRY</code> · else → <code>NEUTRAL RANGE</code>.<br>slope = VIX3M / VIX (&gt;1 contango). uptrend = SPX &gt; 200-day moving average.`;
 
   /* HELP — live numbers injected from the dataset */
@@ -1212,7 +1245,7 @@ function render(){
    el("h-size").textContent=wsd?Math.round(2/Math.abs(wsd)*100):"—";}
 
   const wt=DATA.weights;
-  el("foot").innerHTML=`<b>Composite over 5 independent axes:</b> RICHNESS ${wt.rich}% · CARRY/day ${wt.carry}% · RELIABILITY ${wt.reliab}% · TAIL-SAFETY ${wt.tail}% · STABILITY ${wt.stab}%. &nbsp;·&nbsp; <b>VRP</b> = interpolated implied vol − horizon-matched realized vol, vol points. Percentile/reliability/tail/validation use forward RV; the nowcast uses trailing RV. Free public data only (yfinance). Research tool — evidence, not advice. Not investment advice.`;
+  el("foot").innerHTML=`<b>Composite over 5 independent axes:</b> RICHNESS ${wt.rich}% · CARRY/day ${wt.carry}% · SAFETY ${wt.safety}% · PATH ${wt.path}% · STABILITY ${wt.stab}%. &nbsp;·&nbsp; <b>VRP</b> = interpolated implied vol − horizon-matched realized vol, vol points. Percentile/safety/path/validation use forward RV or the forward price path; the nowcast uses trailing RV. Free public data only (yfinance). Research tool — evidence, not advice. Not investment advice.`;
 }
 
 el("tabs").addEventListener("click",e=>{const b=e.target.closest(".tab");if(!b)return;state.tab=b.dataset.tab;
