@@ -277,6 +277,11 @@ def regime_block(px, labels, slope, up, vrp_hist30, vrp_now30):
     front   = float(px["^VIX9D"].iloc[-1] / px["^VIX"].iloc[-1])   # <1 = steep front contango
     rvt30   = rv_trailing(px, 30)
     rv_acc  = float(rvt30.iloc[-1] / rvt30.iloc[-22]) if rvt30.iloc[-22] and not np.isnan(rvt30.iloc[-22]) else 1.0
+    # rv_composite = rv10 - rv63 (vol points, trailing): >0 = realized vol accelerating vs
+    # its quarter norm. Measured (Ticket 02, 2026-08-26): in CALM/STEADY a positive value
+    # precedes weaker short-vol P&L (-0.7pp straddle). TRANSITION flips sign -> no rule there.
+    r_ = np.log(px["SPX"] / px["SPX"].shift(1))
+    rvc = float(((r_.rolling(10).std() - r_.rolling(63).std()) * math.sqrt(TRADING_YR) * 100).iloc[-1])
 
     return dict(
         current=dict(label=cur, color=REG_COLOR[cur], slope=jnum(sl, 3),
@@ -285,7 +290,8 @@ def regime_block(px, labels, slope, up, vrp_hist30, vrp_now30):
                      spx_state="Uptrend" if bool(up.iloc[-1]) else "Range/Down",
                      ret20=jnum(ret20, 1), vix_pct=jnum(vix_pct, 0), slope_pct=jnum(sl_pct, 0),
                      front=jnum(front, 3), reg_hit=per[cur]["hit"], reg_avg=per[cur]["avg_vrp"],
-                     reg_days=per[cur]["days"], rv_acc=jnum(rv_acc, 2), rv_calm=bool(rv_acc <= 1.05)),
+                     reg_days=per[cur]["days"], rv_acc=jnum(rv_acc, 2), rv_calm=bool(rv_acc <= 1.05),
+                     rvc=jnum(rvc, 2), rvc_accel=bool(rvc > 0)),
         order=REG_ORDER, colors=[REG_COLOR[l] for l in REG_ORDER],
         per_regime=per,
         transition=[[jnum(P[i, j] * 100, 0) for j in range(len(REG_ORDER))] for i in range(len(REG_ORDER))],
@@ -1062,18 +1068,23 @@ function tradeContext(c,reg){
   const thin=st&&st.n<100?' · thin sample':'';
   const calmTail=calm&&st?' · note: largest historical losses started in calm regimes':'';
 
+  // rv_composite drag: measured (2026-08-26) — in CALM/STEADY a positive rv10-rv63
+  // precedes weaker short-vol P&L. Only these two regimes (TRANSITION flips sign).
+  const rvcDrag=calm&&reg.rvc_accel;
+  const rvcEv=rvcDrag?` · ⚠ RV accelerating (rv comp +${num(reg.rvc,2)}) — measured drag on short vol`:'';
   // Short vol, defined risk — thresholds: Favored mean≥0.3 & win≥65 · Caution mean<0 or win<60
   if(st){
-    const ev=mEv+thin+calmTail;
-    if(st.mean>=0.3&&st.hit>=65)push(F,'Iron Condors / Short Strangle','short vol — historically paid in this regime',ev);
+    const ev=mEv+thin+calmTail+rvcEv;
+    if(rvcDrag&&st.mean>=0.3&&st.hit>=65)push(A,'Iron Condors / Short Strangle','short vol — paid here, but RV accelerating (size down)',ev);
+    else if(st.mean>=0.3&&st.hit>=65)push(F,'Iron Condors / Short Strangle','short vol — historically paid in this regime',ev);
     else if(st.mean<0||st.hit<60)push(C,'Iron Condors / Short Strangle','short vol — historically weak in this regime',ev);
     else push(A,'Iron Condors / Short Strangle','short vol — mixed record in this regime',ev);
   }
   // Short vol, undefined risk — stricter: also requires calm realized vol
   if(st){
-    const ev=mEv+(rvCalm?' · RV accel low':' · RV accel elevated')+calmTail;
-    if(st.mean>=0.5&&st.hit>=65&&rvCalm)push(F,'Premium Selling (ATM)','undefined-risk short vol — paid & RV calm',ev);
-    else if(st.mean<0||st.hit<60||!rvCalm)push(C,'Premium Selling (ATM)','undefined risk — weak record or RV accelerating',ev);
+    const ev=mEv+(rvCalm?' · RV accel low':' · RV accel elevated')+calmTail+rvcEv;
+    if(st.mean>=0.5&&st.hit>=65&&rvCalm&&!rvcDrag)push(F,'Premium Selling (ATM)','undefined-risk short vol — paid & RV calm',ev);
+    else if(st.mean<0||st.hit<60||!rvCalm||rvcDrag)push(C,'Premium Selling (ATM)','undefined risk — weak record or RV accelerating',ev);
     else push(A,'Premium Selling (ATM)','size down — mixed record',ev);
   }
   // Term-structure carry — measured: 9/30 ATM call calendar backtest, per current regime
@@ -1186,7 +1197,8 @@ function render(){
   el("chart-term").innerHTML=lineChart(s3,{dates:dts});el("c3-leg").innerHTML=legend(s3);
 
   /* REGIME ANALYSIS */
-  el("reg-grid").innerHTML=[["REGIME",reg.label],["VIX3M/VIX SLOPE",reg.slope+" ("+reg.slope_txt+")"],["VIX",reg.vix+"  ("+ord(reg.vix_pct)+" pct)"],["VIX3M",reg.v3m],["SPX STATE",reg.spx_state],["20-DAY RETURN",(reg.ret20>=0?"+":"")+reg.ret20+"%"]].map(([k,v])=>`<div class="reg-cell"><div class="rk">${k}</div><div class="rv">${v}</div></div>`).join("");
+  const rvcTxt=(reg.rvc>=0?"+":"")+reg.rvc+(reg.rvc_accel?" ⚠ accel":" (calm)");
+  el("reg-grid").innerHTML=[["REGIME",reg.label],["VIX3M/VIX SLOPE",reg.slope+" ("+reg.slope_txt+")"],["VIX",reg.vix+"  ("+ord(reg.vix_pct)+" pct)"],["RV COMPOSITE (rv10−rv63)",rvcTxt],["SPX STATE",reg.spx_state],["20-DAY RETURN",(reg.ret20>=0?"+":"")+reg.ret20+"%"]].map(([k,v])=>`<div class="reg-cell" data-tip="${k.indexOf('RV COMPOSITE')===0?'rv10 − rv63 in vol points: >0 = realized vol accelerating vs its quarter norm. In CALM/STEADY this measurably drags short-vol P&L (Ticket 02).':''}"><div class="rk">${k}</div><div class="rv">${v}</div></div>`).join("");
   const per=DATA.regime.per_regime;
   el("reg-tbl").querySelector("tbody").innerHTML=DATA.regime.order.map((l,i)=>{const p=per[l];return `<tr><td data-tip="${REGTIP[l]||""}"><span style="color:${cv(DATA.regime.colors[i])}">■</span> ${l}</td><td>${p.days}</td><td>${num(p.share,1)}%</td><td>${num(p.avg_vrp,2)}</td><td>${num(p.hit,0)}%</td></tr>`;}).join("");
 
