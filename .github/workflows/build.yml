@@ -8,7 +8,7 @@ on:
     branches: [main]           # every push redeploys with fresh data
 
 permissions:
-  contents: read
+  contents: write          # commit the forward-test log back to the repo
   pages: write
   id-token: write
 
@@ -40,6 +40,18 @@ jobs:
           done
           echo "all attempts failed — previous deployment stays live"
           exit 1
+
+      - name: Commit forward-test log
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add forecast_forward.csv
+          if ! git diff --staged --quiet; then
+            git commit -m "forward-test: log/resolve $(date -u +%F) [skip ci]"
+            git push
+          else
+            echo "no forward-test change"
+          fi
 
       - name: Stage site
         run: mkdir -p dist && cp vrpx_report.html dist/index.html

@@ -427,6 +427,61 @@ def forecast_block(px, labels):
 
 
 # --------------------------------------------------------------------------- #
+# forward test — a genuine, non-circular test: log today's forecast, resolve it
+#   FC_H trading days later. Grows forward only; persisted in forecast_forward.csv
+#   which the CI commits back to the repo each run. Distinct from the retroactive
+#   calibration (which re-derives history) — this one cannot be curve-fit.
+# --------------------------------------------------------------------------- #
+FORWARD_CSV = "forecast_forward.csv"
+
+def forward_test(px, labels, fc):
+    import csv
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), FORWARD_CSV)
+    rows = []
+    if os.path.exists(path):
+        with open(path, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+    idx = labels.index
+    lab = labels.to_numpy()
+    date_pos = {d.strftime("%Y-%m-%d"): i for i, d in enumerate(idx)}
+    today = idx[-1].strftime("%Y-%m-%d")
+
+    # resolve any pending row whose horizon has now elapsed
+    for row in rows:
+        if row.get("status", "PENDING") == "PENDING":
+            pos = date_pos.get(row["date"])
+            if pos is not None and pos + FC_H < len(idx):
+                actual = lab[pos + FC_H]
+                row["actual"] = actual
+                row["resolved_on"] = idx[pos + FC_H].strftime("%Y-%m-%d")
+                row["status"] = "HIT" if actual == row["pred"] else "MISS"
+
+    # append today's forecast once (idempotent per as-of date)
+    if today not in {r["date"] for r in rows}:
+        rows.append(dict(date=today, regime=labels.iloc[-1],
+                         pred=fc["top"], prob=fc["top_prob"],
+                         actual="", resolved_on="", status="PENDING"))
+
+    # write back (CI commits this)
+    cols = ["date", "regime", "pred", "prob", "actual", "resolved_on", "status"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in cols})
+
+    resolved = [r for r in rows if r["status"] in ("HIT", "MISS")]
+    hits = sum(1 for r in resolved if r["status"] == "HIT")
+    pending = [r for r in rows if r["status"] == "PENDING"]
+    recent = list(reversed(rows[-15:]))
+    return dict(since=rows[0]["date"] if rows else today, n_logged=len(rows),
+                n_resolved=len(resolved), n_pending=len(pending),
+                hits=hits, hit_rate=jnum(hits / len(resolved) * 100, 0) if resolved else None,
+                horizon=FC_H, recent=recent)
+
+
+# --------------------------------------------------------------------------- #
 # validation: does high current VRP predict higher captured premium?
 # --------------------------------------------------------------------------- #
 def validation_block(vrp_now30, vrp_hist30):
@@ -761,6 +816,7 @@ def build_data(px):
         reg  = [REG_ORDER.index(l) for l in labels.reindex(ti)],
     )
 
+    fc_block = forecast_block(px, labels)
     src = px.attrs.get("sources", [])
     return dict(
         asof=px.index[-1].strftime("%d %b %Y"),
@@ -776,7 +832,8 @@ def build_data(px):
         colors=CARD_COLORS,
         charts=ch,
         regime=regime_block(px, labels, slope, up, series[30]["vrp_hist"], series[30]["vrp_now"]),
-        forecast=forecast_block(px, labels),
+        forecast=fc_block,
+        forward=forward_test(px, labels, fc_block),
         analog=analog_block(px, labels),
         validation=validation_block(series[30]["vrp_now"], series[30]["vrp_hist"]),
         backtest=backtest_block(px, series[30]["iv"], labels, series[30]["vrp_now"], rate),
@@ -1084,7 +1141,11 @@ TEMPLATE = r"""<meta charset="utf-8">
     <div class="box"><div class="box-title" id="fc-cal-title"></div>
       <table class="tbl" id="fc-cal"><thead><tr><th>Forecast confidence</th><th>N</th><th>Avg confidence</th><th>Actual accuracy</th><th>Calibration error</th></tr></thead><tbody></tbody></table>
       <div class="box-note" id="fc-cal-note"></div></div>
-    <div class="box"><div class="box-title">▶ FORECAST JOURNAL · last 15 days · resolved HIT/MISS after the horizon</div>
+    <div class="box"><div class="box-title" id="fw-title"></div>
+      <div class="box-note" style="margin-top:0" id="fw-sub"></div>
+      <div class="reg-grid" id="fw-cards" style="margin-top:10px"></div>
+      <table class="tbl" id="fw-tbl" style="margin-top:10px"><thead><tr><th>Logged</th><th>Regime</th><th>Predicted next</th><th>Prob</th><th>Resolved</th><th>Actual</th><th>Status</th></tr></thead><tbody></tbody></table></div>
+    <div class="box"><div class="box-title">▶ FORECAST JOURNAL (retroactive) · last 15 days · resolved HIT/MISS after the horizon</div>
       <table class="tbl" id="fc-jrn"><thead><tr><th>Date</th><th>Regime that day</th><th>Predicted next</th><th>Prob</th><th>Actual</th><th>Status</th></tr></thead><tbody></tbody></table></div>
     <div class="box"><div class="box-title">▶ EMPIRICAL TRANSITION MATRIX · P(next-day regime | today) % · full history</div>
       <div style="overflow-x:auto"><table class="mtx" id="mtx"></table></div>
@@ -1479,6 +1540,17 @@ function render(){
   el("fc-cal").querySelector("tbody").innerHTML=cal.buckets.map(b=>`<tr><td>${b.bucket}</td><td>${b.n}</td><td>${b.conf==null?"—":b.conf+"%"}</td><td>${b.acc==null?"—":b.acc+"%"}</td><td class="${b.err==null?"":(b.err<0?"bad":"good")}">${b.err==null?"—":(b.err>0?"+":"")+b.err+" pp"}</td></tr>`).join("");
   el("fc-cal-note").innerHTML=`Each day's forecast is re-derived from data up to that day, then marked HIT/MISS after ${F.horizon} trading days. This is a <b>simulated causal replay, not a live journal</b> — identical for everyone, regenerated each build. Overall: avg confidence ${cal.overall_conf}%, actual ${cal.overall_acc}% → <b class="${cal.bias_pp<0?'bad':'good'}">${cal.bias} (${cal.bias_pp>0?"+":""}${cal.bias_pp} pp)</b>. Quality ${cal.quality}/100. Bucket errors are shown, not hidden — that is what the curve is for.`;
   el("fc-jrn").querySelector("tbody").innerHTML=F.journal.map(j=>`<tr><td>${j.date}</td><td><span style="color:${cv(REG_COLOR_JS(j.regime))}">${j.regime}</span></td><td>${j.pred}</td><td>${j.prob}%</td><td>${j.actual||"—"}</td><td class="${j.status==='HIT'?'good':j.status==='MISS'?'bad':''}">${j.status}</td></tr>`).join("");
+
+  /* FORWARD TEST — genuine out-of-sample, grows forward only */
+  const FW=DATA.forward;
+  el("fw-title").textContent=`▶ FORWARD TEST · live, out-of-sample · started ${FW.since}`;
+  el("fw-sub").innerHTML=`The honest test: each build logs that day's forecast and marks it HIT/MISS ${FW.horizon} trading days later. Unlike the retroactive curve above, this <b>cannot be curve-fit</b> — it only grows forward. ${FW.n_resolved===0?"<b>No forecasts have resolved yet — building up.</b>":""}`;
+  el("fw-cards").innerHTML=[
+    ["RESOLVED",`${FW.n_resolved}`],
+    ["HIT RATE",FW.hit_rate==null?"— (building up)":`${FW.hit_rate}% (${FW.hits}/${FW.n_resolved})`],
+    ["PENDING",`${FW.n_pending}`],
+  ].map(([k,v])=>`<div class="reg-cell"><div class="rk">${k}</div><div class="rv">${v}</div></div>`).join("");
+  el("fw-tbl").querySelector("tbody").innerHTML=FW.recent.length?FW.recent.map(j=>`<tr><td>${j.date}</td><td><span style="color:${cv(REG_COLOR_JS(j.regime))}">${j.regime}</span></td><td>${j.pred}</td><td>${j.prob}%</td><td>${j.resolved_on||"—"}</td><td>${j.actual||"—"}</td><td class="${j.status==='HIT'?'good':j.status==='MISS'?'bad':''}">${j.status}</td></tr>`).join(""):`<tr><td colspan="7" class="dim">No entries yet — the first build logs today's forecast.</td></tr>`;
 
   /* SETTINGS */
   el("set-src").innerHTML=DATA.sources.map(s=>
