@@ -94,22 +94,62 @@ def pct_rank(win, value):
 
 # --------------------------------------------------------------------------- #
 # data
+#   VIX family: Cboe direct CSV is PRIMARY (Yahoo repeatedly serves these Cboe tickers
+#   1-row only — an outage that froze the site for a week in Aug 2026). Yahoo is the
+#   fallback. SPX stays Yahoo (Cboe has no ^GSPC; ^GSPC downloads fine).
 # --------------------------------------------------------------------------- #
+def _cboe_close(sym):
+    import io, requests
+    url = f"https://cdn.cboe.com/api/global/us_indices/daily_prices/{sym}_History.csv"
+    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    df["DATE"] = pd.to_datetime(df["DATE"], format="%m/%d/%Y")
+    s = df.set_index("DATE")["CLOSE"].sort_index()
+    return s[s.index >= START]
+
+def _yf_close(sym):
+    y = yf.download(sym, start=START, progress=False, auto_adjust=True)["Close"]
+    if isinstance(y, pd.DataFrame):
+        y = y.iloc[:, 0]
+    return y.dropna()
+
 def load():
-    tk = ["^GSPC", "^VIX", "^VIX9D", "^VIX3M", "^VIX6M"]
-    px = yf.download(tk, start=START, progress=False, auto_adjust=True)["Close"]
-    px = px.rename(columns={"^GSPC": "SPX"})
+    spx = _yf_close("^GSPC").rename("SPX")
+    fam_map = [("^VIX", "VIX"), ("^VIX9D", "VIX9D"), ("^VIX3M", "VIX3M"), ("^VIX6M", "VIX6M")]
+    cols = {"SPX": spx}
+    origin = {"SPX": "Yahoo ^GSPC"}
+    for yf_sym, cboe_sym in fam_map:
+        s, where = None, "—"
+        try:
+            c = _cboe_close(cboe_sym)
+            if len(c) > 100:
+                s, where = c, "Cboe"
+        except Exception:
+            pass
+        if s is None:                                   # fallback to Yahoo
+            try:
+                y = _yf_close(yf_sym)
+                if len(y) > 100:
+                    s, where = y, "Yahoo"
+            except Exception:
+                pass
+        cols[yf_sym] = s
+        origin[yf_sym] = where + (" " + cboe_sym if where == "Cboe" else "")
+    px = pd.DataFrame(cols)
+
     # real per-source freshness, measured BEFORE ffill (ffill would mask staleness)
     src = []
     for name, col in [("SPX", "SPX"), ("VIX", "^VIX"), ("VIX9D", "^VIX9D"),
                       ("VIX3M", "^VIX3M"), ("VIX6M", "^VIX6M")]:
-        s = px[col].dropna()
+        s = px[col].dropna() if col in px else pd.Series(dtype=float)
         lag = int((px.index >= s.index[-1]).sum() - 1) if len(s) else 9999
         src.append(dict(name=name, ticker=col if col != "SPX" else "^GSPC",
+                        source=origin.get(col, "—"),
                         last=s.index[-1].strftime("%d %b %Y") if len(s) else "—",
                         lag=lag, ok=bool(lag <= 3)))
-    # close interior gaps (Cboe drops the odd day) via ffill; COUNT how many rows were
-    # carried so the freshness layer can flag the series as degraded rather than pretend.
+    # close interior gaps (a source drops the odd day) via ffill; COUNT how many rows
+    # were carried so the freshness layer can flag the series as degraded, not pretend.
     fill_counts = {}
     for c in ["^VIX", "^VIX9D", "^VIX3M", "^VIX6M"]:
         s = px[c]
@@ -1042,7 +1082,7 @@ TEMPLATE = r"""<meta charset="utf-8">
   <div class="strip window">
     <div class="win-row">
       <span><span class="lbl">📅 DATA WINDOW</span><span class="val" id="w-range"></span> <span class="val dim" id="w-sess"></span></span>
-      <span><span class="lbl">DATA SOURCE:</span><span class="val dim">SPX ^GSPC (Yahoo) + VIX/VIX9D/VIX3M/VIX6M (Cboe via Yahoo)</span></span>
+      <span><span class="lbl">DATA SOURCE:</span><span class="val dim">SPX ^GSPC (Yahoo) + VIX/VIX9D/VIX3M/VIX6M (Cboe direct, Yahoo fallback)</span></span>
     </div>
     <div class="win-sub"><span class="lbl">IV:</span><span class="val">Total-variance interpolation VIX9D→VIX</span>
       <span class="lbl" style="margin-left:14px">RV:</span><span class="val">Forward realized vol, horizon-matched</span></div>
@@ -1562,7 +1602,7 @@ function render(){
 
   /* SETTINGS */
   el("set-src").innerHTML=DATA.sources.map(s=>
-    `<div class="row"><span class="rk">${s.name}</span><span class="rv">${s.ticker} · last ${s.last} · <span class="${s.ok?"chk":"chx"}">${s.ok?"✓ fresh":"✗ stale ("+s.lag+" sessions)"}</span>${s.filled?` · <span class="chx" title="interior gaps carried forward (ffill)">⚠ ${s.filled} filled</span>`:""}</span></div>`).join("");
+    `<div class="row"><span class="rk">${s.name}</span><span class="rv">${s.ticker} · ${s.source||"—"} · last ${s.last} · <span class="${s.ok?"chk":"chx"}">${s.ok?"✓ fresh":"✗ stale ("+s.lag+" sessions)"}</span>${s.filled?` · <span class="chx" title="interior gaps carried forward (ffill)">⚠ ${s.filled} filled</span>`:""}</span></div>`).join("");
   el("set-par").innerHTML=[["History start",DATA.first],["As of",DATA.asof],["Total sessions",DATA.n_total],["DTE horizons",DATA.dtes.join(" / ")],["Lookbacks",Object.values(DATA.lookbacks).map(l=>l.name).join(" · ")],["Term nodes (days)",Object.entries(DATA.node_days).map(([k,v])=>k+"="+v).join(" · ")],["Forecast horizon",DATA.forecast.horizon+" trading days (streak-adjusted persistence)"]].map(([k,x])=>`<div class="row"><span class="rk">${k}</span><span class="rv">${x}</span></div>`).join("");
   el("set-w").innerHTML=Object.entries(DATA.weights).map(([k,x])=>`<div class="row"><span class="rk">${k.toUpperCase()}</span><span class="rv">${x}%</span></div>`).join("");
   el("set-subs").innerHTML=`<b style="color:var(--ink-dim)">RICH</b> — richness: percentile of current VRP within this DTE's own trailing history (rich IV vs its norm).<br><b style="color:var(--ink-dim)">CARRY</b> — carry per day: VRP ÷ calendar days, ranked across the DTE set (which tenor pays most premium per day now, relative).<br><b style="color:var(--ink-dim)">SAFETY</b> — merged reliability (info ratio = mean ÷ std of forward VRP) + tail-safety (1 − |CVaR₅|). These two were measured to be redundant (Spearman +0.89 on the real definitions, 2026-08-26), so they are one axis to avoid double-counting.<br><b style="color:var(--ink-dim)">PATH</b> — path-safety: trailing mean Max Adverse Excursion of the SPX price path over the forward window, inverted percentile within its own window history. A genuine <i>path</i> axis (the price journey), distinct from SAFETY's VRP-outcome tail.<br><b style="color:var(--ink-dim)">STAB</b> — stability: steadiness of recent VRP vs its window dispersion.<br>Five decorrelated axes — level, cross-sectional carry, outcome safety, path safety, steadiness — so the composite doesn't double-count. <b>Note:</b> the composite ranks premium <i>quality/safety</i>, not expected P&L — measured (2026-08-26) low-vol conditions precede weaker short-vol returns (complacency).`;
