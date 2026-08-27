@@ -119,30 +119,29 @@ def load():
     fam_map = [("^VIX", "VIX"), ("^VIX9D", "VIX9D"), ("^VIX3M", "VIX3M"), ("^VIX6M", "VIX6M")]
     cols = {"SPX": spx}
     origin = {"SPX": "Yahoo ^GSPC"}
-    # Load BOTH sources and let the one with MORE rows win, above a hard floor. A partial
-    # download (Yahoo's 1-row outage, or a truncated CSV) must never silently replace a
-    # full history — that failure class froze the site for a week and, per a peer project,
-    # can shorten a data window for weeks unnoticed. Row-count guard, credit quantconnect-47.
+    # Cboe is THE source, deterministically; Yahoo is emergency-only. The row-count guard
+    # protects WITHIN a source against a broken (1-row / truncated) download — it does NOT
+    # arbitrate between sources. "Most rows wins" would make the source a runtime decision:
+    # if Yahoo recovers with one extra row (a holiday/dup difference) the choice flips
+    # silently and two runs measure different series — a reproducibility bug that looks
+    # like a finding. The used source is recorded (origin -> Settings tab). Credit
+    # quantconnect-47 for both the guard and this correction.
     MIN_ROWS = 1000
     for yf_sym, cboe_sym in fam_map:
-        cands = []
+        s, where = None, "—"
         try:
             c = _cboe_close(cboe_sym)
-            if len(c) >= MIN_ROWS:
-                cands.append((len(c), c, "Cboe " + cboe_sym))
+            if len(c) >= MIN_ROWS:                      # guard within the primary source
+                s, where = c, "Cboe " + cboe_sym
         except Exception:
             pass
-        try:
-            y = _yf_close(yf_sym)
-            if len(y) >= MIN_ROWS:
-                cands.append((len(y), y, "Yahoo"))
-        except Exception:
-            pass
-        if cands:
-            cands.sort(key=lambda t: t[0], reverse=True)   # most rows wins
-            _, s, where = cands[0]
-        else:
-            s, where = None, "—"
+        if s is None:                                    # Cboe failed/too short -> emergency
+            try:
+                y = _yf_close(yf_sym)
+                if len(y) >= MIN_ROWS:
+                    s, where = y, "Yahoo (fallback)"
+            except Exception:
+                pass
         cols[yf_sym] = s
         origin[yf_sym] = where
     px = pd.DataFrame(cols)
