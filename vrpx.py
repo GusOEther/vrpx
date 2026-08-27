@@ -119,23 +119,32 @@ def load():
     fam_map = [("^VIX", "VIX"), ("^VIX9D", "VIX9D"), ("^VIX3M", "VIX3M"), ("^VIX6M", "VIX6M")]
     cols = {"SPX": spx}
     origin = {"SPX": "Yahoo ^GSPC"}
+    # Load BOTH sources and let the one with MORE rows win, above a hard floor. A partial
+    # download (Yahoo's 1-row outage, or a truncated CSV) must never silently replace a
+    # full history — that failure class froze the site for a week and, per a peer project,
+    # can shorten a data window for weeks unnoticed. Row-count guard, credit quantconnect-47.
+    MIN_ROWS = 1000
     for yf_sym, cboe_sym in fam_map:
-        s, where = None, "—"
+        cands = []
         try:
             c = _cboe_close(cboe_sym)
-            if len(c) > 100:
-                s, where = c, "Cboe"
+            if len(c) >= MIN_ROWS:
+                cands.append((len(c), c, "Cboe " + cboe_sym))
         except Exception:
             pass
-        if s is None:                                   # fallback to Yahoo
-            try:
-                y = _yf_close(yf_sym)
-                if len(y) > 100:
-                    s, where = y, "Yahoo"
-            except Exception:
-                pass
+        try:
+            y = _yf_close(yf_sym)
+            if len(y) >= MIN_ROWS:
+                cands.append((len(y), y, "Yahoo"))
+        except Exception:
+            pass
+        if cands:
+            cands.sort(key=lambda t: t[0], reverse=True)   # most rows wins
+            _, s, where = cands[0]
+        else:
+            s, where = None, "—"
         cols[yf_sym] = s
-        origin[yf_sym] = where + (" " + cboe_sym if where == "Cboe" else "")
+        origin[yf_sym] = where
     px = pd.DataFrame(cols)
 
     # real per-source freshness, measured BEFORE ffill (ffill would mask staleness)
