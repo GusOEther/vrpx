@@ -90,17 +90,55 @@ def pct_rank(win, value):
 # --------------------------------------------------------------------------- #
 # data
 # --------------------------------------------------------------------------- #
+def _cboe_close(sym):
+    import io, requests
+    url = f"https://cdn.cboe.com/api/global/us_indices/daily_prices/{sym}_History.csv"
+    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    df["DATE"] = pd.to_datetime(df["DATE"], format="%m/%d/%Y")
+    s = df.set_index("DATE")["CLOSE"].sort_index()
+    return s[s.index >= START]
+
+def _yf_close(sym):
+    y = yf.download(sym, start=START, progress=False, auto_adjust=True)["Close"]
+    if isinstance(y, pd.DataFrame):
+        y = y.iloc[:, 0]
+    return y.dropna()
+
 def load():
-    tk = ["^GSPC", "^VIX", "^VIX9D", "^VIX3M", "^VIX6M"]
-    px = yf.download(tk, start=START, progress=False, auto_adjust=True)["Close"]
-    px = px.rename(columns={"^GSPC": "SPX"})
+    # VIX family: Cboe direct CSV primary (Yahoo repeatedly served these 1-row only,
+    # froze the site for a week in Aug 2026), Yahoo fallback. SPX stays Yahoo.
+    spx = _yf_close("^GSPC").rename("SPX")
+    fam_map = [("^VIX", "VIX"), ("^VIX9D", "VIX9D"), ("^VIX3M", "VIX3M"), ("^VIX6M", "VIX6M")]
+    cols = {"SPX": spx}
+    origin = {"SPX": "Yahoo ^GSPC"}
+    for yf_sym, cboe_sym in fam_map:
+        s, where = None, "—"
+        try:
+            c = _cboe_close(cboe_sym)
+            if len(c) > 100:
+                s, where = c, "Cboe"
+        except Exception:
+            pass
+        if s is None:
+            try:
+                y = _yf_close(yf_sym)
+                if len(y) > 100:
+                    s, where = y, "Yahoo"
+            except Exception:
+                pass
+        cols[yf_sym] = s
+        origin[yf_sym] = where + (" " + cboe_sym if where == "Cboe" else "")
+    px = pd.DataFrame(cols)
     # real per-source freshness, measured BEFORE ffill (ffill would mask staleness)
     src = []
     for name, col in [("SPX", "SPX"), ("VIX", "^VIX"), ("VIX9D", "^VIX9D"),
                       ("VIX3M", "^VIX3M"), ("VIX6M", "^VIX6M")]:
-        s = px[col].dropna()
+        s = px[col].dropna() if col in px else pd.Series(dtype=float)
         lag = int((px.index >= s.index[-1]).sum() - 1) if len(s) else 9999
         src.append(dict(name=name, ticker=col if col != "SPX" else "^GSPC",
+                        source=origin.get(col, "—"),
                         last=s.index[-1].strftime("%d %b %Y") if len(s) else "—",
                         lag=lag, ok=bool(lag <= 3)))
     for c in ["^VIX", "^VIX9D", "^VIX3M", "^VIX6M"]:
@@ -741,7 +779,7 @@ TEMPLATE = r"""<title>VRPX — Volatility Risk Premium Analyzer (open-data rebui
   <div class="strip window">
     <div class="win-row">
       <span><span class="lbl">📅 DATA WINDOW</span><span class="val" id="w-range"></span> <span class="val dim" id="w-sess"></span></span>
-      <span><span class="lbl">DATA SOURCE:</span><span class="val dim">SPX ^GSPC (Yahoo) + VIX/VIX9D/VIX3M/VIX6M (Cboe via Yahoo)</span></span>
+      <span><span class="lbl">DATA SOURCE:</span><span class="val dim">SPX ^GSPC (Yahoo) + VIX/VIX9D/VIX3M/VIX6M (Cboe direct, Yahoo fallback)</span></span>
     </div>
     <div class="win-sub"><span class="lbl">IV:</span><span class="val">Total-variance interpolation VIX9D→VIX</span>
       <span class="lbl" style="margin-left:14px">RV:</span><span class="val">Forward realized vol, horizon-matched</span></div>
