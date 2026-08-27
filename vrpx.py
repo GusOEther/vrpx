@@ -820,6 +820,7 @@ def build_data(px):
     src = px.attrs.get("sources", [])
     return dict(
         asof=px.index[-1].strftime("%d %b %Y"),
+        asof_iso=px.index[-1].strftime("%Y-%m-%d"),
         first=px.index[0].strftime("%d %b %Y"),
         n_total=len(px),
         sources=src, n_ok=sum(1 for s in src if s["ok"]),
@@ -996,6 +997,13 @@ TEMPLATE = r"""<meta charset="utf-8">
   button.pbtn{padding:6px 14px;border:1px solid var(--line-2);border-radius:4px;color:var(--green);background:var(--panel-2);cursor:pointer;font-family:inherit;font-size:12px}
   @media print{.tabs,.top-right{display:none} .panel{display:block!important} .box{break-inside:avoid}}
 </style>
+<div id="stale-overlay" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9999;
+  background:#3a1417;border-bottom:2px solid var(--red);color:#ffdfe3;font-family:var(--mono);
+  font-size:12.5px;letter-spacing:.5px;padding:9px 16px;text-align:center;box-shadow:0 2px 12px rgba(0,0,0,.5)">
+  <span id="stale-msg"></span>
+  <button id="stale-x" style="margin-left:14px;background:none;border:1px solid var(--red);color:#ffdfe3;
+    cursor:pointer;padding:1px 7px;border-radius:3px;font-family:inherit">dismiss</button>
+</div>
 <div class="app">
   <div class="topbar">
     <div class="brand"><b>VRPX</b></div>
@@ -1608,6 +1616,27 @@ document.addEventListener("mousemove",e=>{
   tipEl.style.left=x+"px";tipEl.style.top=y+"px";});
 
 render();
+
+/* stale-data self-check: the page compares its own data date to the viewer's clock.
+   Works even when the build is frozen (a source outage stops the rebuild) — the live
+   page flags itself as stale without a new deploy. Trading-day aware: weekends don't count. */
+(function(){
+  try{
+    const asof=new Date(DATA.asof_iso+"T00:00:00");
+    const now=new Date();
+    let bdays=0; const d=new Date(asof);
+    while(d<now){d.setDate(d.getDate()+1);const wd=d.getDay();if(wd!==0&&wd!==6)bdays++;}
+    const THRESH=3;                       // >3 business days stale = source likely disrupted
+    if(bdays>THRESH){
+      el("stale-msg").innerHTML=`⚠ <b>DATA MAY BE STALE</b> — last successful update <b>${DATA.asof}</b> `+
+        `(${bdays} business days ago). The free data source (Yahoo/Cboe) is likely disrupted; `+
+        `every figure reflects that date, not today. The build refreshes automatically once the source recovers.`;
+      el("stale-overlay").style.display="block";
+      document.body.style.paddingTop=el("stale-overlay").offsetHeight+"px";
+    }
+    el("stale-x").addEventListener("click",()=>{el("stale-overlay").style.display="none";document.body.style.paddingTop="0";});
+  }catch(e){}
+})();
 </script>
 """
 
