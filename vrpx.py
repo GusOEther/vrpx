@@ -3,19 +3,20 @@
 VRPX  -  Volatility Risk Premium Term-Structure Analyzer  (open-data rebuild)
 
 A working rebuild of the *functionality* behind the VRPX PRO dashboard - every
-tab does a real computation on real, free data (yfinance: SPX + VIX family).
-Python computes everything up front and embeds it as JSON; client-side JS makes
-the whole UI interactive (tabs + lookback), no server, works offline.
+tab does a real computation on real, free data (SPX from Yahoo, VIX family direct
+from Cboe). Python computes everything up front and embeds it as JSON; client-side
+JS makes the whole UI interactive (tabs + lookback), no server, works offline.
 
 Tabs / functions:
-  OVERVIEW        - DTE composite cards (IV, VRP, percentile, hit, worst, sub-scores)
+  OVERVIEW        - DTE composite cards, trade context, expected move vs measured coverage
   VRP MATRIX      - monthly VRP by DTE, last 24 months (heatmap)
   CHARTS          - IV vs RV, VRP by DTE, VIX term-structure history (line charts)
-  REGIME ANALYSIS - regime distribution + per-regime forward-VRP / hit stats
-  VALIDATION      - does the signal pay? quintile buckets + overlapping equity curve
-  REGIME TIMELINE - historical regime ribbon over time
-  REGIME FORECAST - empirical Markov transition matrix + h-step forecast
-  SETTINGS        - data-source status, parameters, weights, rules
+  REGIME ANALYSIS - current regime, term structure, per-regime forward-VRP / hit stats
+  VALIDATION      - does the signal pay? quintiles, equity proxy, analog (k-NN) engine
+  BACKTEST        - five BS-reconstructed option structures, per regime / quintile
+  REGIME TIMELINE - historical regime ribbon + change log
+  REGIME FORECAST - 5-day streak-adjusted persistence forecast, calibration, forward test
+  HELP / SETTINGS - how to read it; data-source status, parameters, weights, rules
   EXPORT          - print / save as PDF
 
 Reproducible core:
@@ -41,7 +42,6 @@ TRADING_YR = 252
 LOOKBACKS  = {63: "3M", 126: "6M", 252: "1Y", 504: "2Y", 1260: "5Y"}
 DEFAULT_LB = 504
 CHART_TAIL = 1260
-FORECAST_H = 20                       # trading days ahead for the Markov forecast
 BT_DTE   = 30                         # backtest: tenor (calendar days)
 BT_SLIP  = 0.02                       # modeled cost = 2% of premium (bid-ask/commission)
 BT_Q     = 0.018                      # assumed SPX dividend yield (constant)
@@ -143,7 +143,7 @@ def load():
                     s, where = y, "Yahoo (fallback)"
             except Exception:
                 pass
-        cols[yf_sym] = s
+        cols[yf_sym] = s if s is not None else pd.Series(dtype=float)   # dead -> NaN, not a crash
         origin[yf_sym] = where
     px = pd.DataFrame(cols)
     # Cboe lists ^VIX on US market holidays (~33 since 2022) where nothing else has a
@@ -243,33 +243,35 @@ def dte_series(px, dte):
     vrp_hist = iv - rvf                      # forward outcome (for stats)
     vrp_now  = iv - rvt                      # nowcast (no forward yet)
     mae = mae_series(px, dte)                # causal path risk
-    rv_acc = (rvt.iloc[-1] / rvt.iloc[-22]) if not np.isnan(rvt.iloc[-22]) and rvt.iloc[-22] else 1.0
-    gamma  = float(np.clip(100 * (1 - (rv_acc - 1)), 0, 100))
     return dict(dte=dte, iv=iv, rvt=rvt, cur_iv=float(iv.iloc[-1]),
                 cur_vrp=float(vrp_now.iloc[-1]), vrp_hist=vrp_hist,
-                vrp_now=vrp_now, mae=mae, gamma=gamma)
+                vrp_now=vrp_now, mae=mae)
 
 def cards_for(series, N):
     """Compute all DTE cards for a lookback together (needed for cross-sectional carry)."""
     raw = {}
     for d in DTES:
         ds  = series[d]
-        win = ds["vrp_hist"].dropna().tail(N).to_numpy()
+        win = ds["vrp_hist"].dropna().tail(N).to_numpy()     # forward OUTCOMES: hit/worst/ir/cvar
+        wn  = ds["vrp_now"].dropna().tail(N).to_numpy()      # nowcasts: like-with-like for rich/stab
         cur = ds["cur_vrp"]
         mean, sd = (np.nanmean(win), np.nanstd(win)) if len(win) else (np.nan, np.nan)
         ir   = mean / sd if sd else np.nan
         p5   = np.nanpercentile(win, 5) if len(win) else np.nan
         tailv = win[win <= p5]
         cvar = float(np.nanmean(tailv)) if len(tailv) else np.nan
+        # RICH/STAB rank today's NOWCAST against past nowcasts (it was ranked against forward
+        # outcomes, a different distribution — review 2026-10-06).
+        sdn = np.nanstd(wn) if len(wn) else np.nan
         recent = ds["vrp_now"].dropna().tail(21).std()
-        stab = 100 * (1 - min(recent / sd, 1)) if sd and sd > 0 else 50.0
+        stab = 100 * (1 - min(recent / sdn, 1)) if sdn and sdn > 0 else 50.0
         # PATH: self-relative percentile of the recent path risk vs this DTE's own
         # window history (cross-sectional MAE is trivially monotone in horizon, so it
         # would only measure window length — the percentile normalises that away).
         mwin = ds["mae"].dropna().tail(N).to_numpy()
         recent_mae = float(np.nanmean(mwin[-21:])) if len(mwin) else np.nan
         path = (100 - pct_rank(mwin, recent_mae)) if len(mwin) and not np.isnan(recent_mae) else 50.0
-        raw[d] = dict(cur_iv=ds["cur_iv"], cur_vrp=cur, rich=pct_rank(win, cur), ir=ir,
+        raw[d] = dict(cur_iv=ds["cur_iv"], cur_vrp=cur, rich=pct_rank(wn, cur), ir=ir,
                       cvar=cvar, stab=stab, carry_pd=cur / d, path=path,
                       hit=float((win > 0).mean() * 100) if len(win) else np.nan,
                       worst=float(np.nanmin(win)) if len(win) else np.nan)
@@ -281,12 +283,14 @@ def cards_for(series, N):
         r = raw[d]
         carry  = 100 * (r["carry_pd"] - cmin) / rng if rng > 1e-9 else 50.0
         reliab = float(np.clip((0 if np.isnan(r["ir"]) else r["ir"]) / 0.8 * 100, 0, 100))
-        tail   = float(np.clip(100 * (1 - abs(r["cvar"]) / 50), 0, 100)) if not np.isnan(r["cvar"]) else 50.0
+        # only a NEGATIVE worst-5% outcome is a tail loss (abs() penalised a positive one)
+        tail   = float(np.clip(100 * (1 - max(-r["cvar"], 0) / 50), 0, 100)) if not np.isnan(r["cvar"]) else 50.0
         safety = (reliab + tail) / 2.0                       # merged axis (rho +0.885)
         path   = r["path"]
         subs = {"rich": r["rich"], "carry": carry, "safety": safety, "path": path, "stab": r["stab"]}
         comp = sum(W[k] * (0 if (subs[k] is None or np.isnan(subs[k])) else subs[k]) for k in W)
-        cards.append(dict(dte=d, cur_iv=jnum(r["cur_iv"]), cur_vrp=jnum(r["cur_vrp"]),
+        cards.append(dict(dte=d, res_end=series[d]["vrp_hist"].dropna().index[-1].strftime("%d %b %Y"),
+                          cur_iv=jnum(r["cur_iv"]), cur_vrp=jnum(r["cur_vrp"]),
                           vrp_pct=jnum(r["rich"]), hit=jnum(r["hit"]), worst=jnum(r["worst"]),
                           composite=jnum(comp), subs={k: jnum(v) for k, v in subs.items()}))
     return cards
@@ -346,6 +350,9 @@ def regime_block(px, labels, slope, up, vrp_hist30, vrp_now30):
     for N in LOOKBACKS:
         if N > len(labels):
             continue
+        if N - trading_days(30) < MIN_REG_N:              # 3M: at most 42 resolved obs, gate can't pass
+            per_lb[str(N)] = dict(na=True, max_n=N - trading_days(30))
+            continue
         wl = labels.iloc[-N:]
         cell = {}
         for lab in REG_ORDER:
@@ -360,52 +367,67 @@ def regime_block(px, labels, slope, up, vrp_hist30, vrp_now30):
                 cell[lab] = dict(days=days, n=int(len(vals)), avg_vrp=None, hit=None, ok=False)
         per_lb[str(N)] = cell
 
-    # transition matrix + forecast
+    # day->next-day transition matrix (descriptive; the forecast is forecast_block)
     M, P = transition_matrix(labels)
-    Ph = np.linalg.matrix_power(P, FORECAST_H)
-    ci = REG_ORDER.index(cur)
-    fc_1  = P[ci]
-    fc_h  = Ph[ci]
 
     # diagnostics: where do we sit vs history
     vix_pct = float((px["^VIX"].to_numpy() < vix).mean() * 100)
-    sl_pct  = float((slope.dropna().to_numpy() < sl).mean() * 100)
-    front   = float(px["^VIX9D"].iloc[-1] / px["^VIX"].iloc[-1])   # <1 = steep front contango
-    rvt30   = rv_trailing(px, 30)
-    rv_acc  = float(rvt30.iloc[-1] / rvt30.iloc[-22]) if rvt30.iloc[-22] and not np.isnan(rvt30.iloc[-22]) else 1.0
     # rv_composite = rv10 - rv63 (vol points, trailing): >0 = realized vol accelerating vs
-    # its quarter norm. Measured (Ticket 02, 2026-08-26): in CALM/STEADY a positive value
-    # precedes weaker short-vol P&L (-0.7pp straddle). TRANSITION flips sign -> no rule there.
+    # its quarter norm. Measured (2026-08-26): in CALM/STEADY a positive value precedes
+    # weaker short-vol P&L. TRANSITION flips sign -> no rule there.
     r_ = np.log(px["SPX"] / px["SPX"].shift(1))
     rvc = float(((r_.rolling(10).std() - r_.rolling(63).std()) * math.sqrt(TRADING_YR) * 100).iloc[-1])
 
+    # current run + label churn. Labels have no hysteresis (deliberately: the backtest is
+    # bound to them), so a fresh label is often a 1-2 session blip — measured 2026-10-06:
+    # 43.7 % of all label changes reverted within 2 sessions (both halves >= 42 %).
+    lab = labels.to_numpy()
+    dts = labels.index
+    chg = np.flatnonzero(lab[1:] != lab[:-1]) + 1            # positions where a new run starts
+    run_start = int(chg[-1]) if len(chg) else 0
+    run_days = len(lab) - run_start
+    prev = lab[run_start - 1] if run_start > 0 else None
+    def reverted(t):                                         # back to the prior label within 2
+        return any(t + k < len(lab) and lab[t + k] == lab[t - 1] for k in (1, 2))
+    done = [t for t in chg if t + 2 < len(lab)]
+    into = [t for t in done if lab[t] == cur]
+    log = []
+    for j in range(len(chg) - 1, max(len(chg) - 13, -1), -1):
+        t = int(chg[j]); end = int(chg[j + 1]) if j + 1 < len(chg) else len(lab)
+        log.append(dict(date=dts[t].strftime("%Y-%m-%d"), frm=lab[t - 1], to=lab[t],
+                        run=end - t, ongoing=bool(j == len(chg) - 1)))
+    run = dict(days=run_days, since=dts[run_start].strftime("%d %b %Y"), prev=prev,
+               n_changes=int(len(chg)), share_rev2=jnum(np.mean([reverted(t) for t in done]) * 100, 0),
+               into_n=len(into), into_rev2=jnum(np.mean([reverted(t) for t in into]) * 100, 0) if into else None,
+               log=log)
+
+    sl_txt = "contango" if sl >= 1 else ("flat / mild backwardation" if sl >= 0.97 else "backwardation")
     return dict(
-        current=dict(label=cur, color=REG_COLOR[cur], slope=jnum(sl, 3),
-                     slope_txt="contango" if sl >= 1 else "backwardation",
+        current=dict(label=cur, color=REG_COLOR[cur], slope=jnum(sl, 3), slope_txt=sl_txt,
                      vix=jnum(vix, 1), v3m=jnum(v3m, 1),
                      spx_state="Uptrend" if bool(up.iloc[-1]) else "Range/Down",
-                     ret20=jnum(ret20, 1), vix_pct=jnum(vix_pct, 0), slope_pct=jnum(sl_pct, 0),
-                     front=jnum(front, 3), reg_hit=per[cur]["hit"], reg_avg=per[cur]["avg_vrp"],
-                     reg_days=per[cur]["days"], rv_acc=jnum(rv_acc, 2), rv_calm=bool(rv_acc <= 1.05),
-                     rvc=jnum(rvc, 2), rvc_accel=bool(rvc > 0)),
+                     ret20=jnum(ret20, 1), vix_pct=jnum(vix_pct, 0),
+                     reg_hit=per[cur]["hit"], reg_avg=per[cur]["avg_vrp"],
+                     reg_days=per[cur]["days"], rvc=jnum(rvc, 2), rvc_accel=bool(rvc > 0)),
+        run=run,
         order=REG_ORDER, colors=[REG_COLOR[l] for l in REG_ORDER],
         per_regime=per, per_regime_lb=per_lb, min_reg_n=MIN_REG_N,
         transition=[[jnum(P[i, j] * 100, 0) for j in range(len(REG_ORDER))] for i in range(len(REG_ORDER))],
-        counts=[int((labels == l).sum()) for l in REG_ORDER],
-        forecast_1=[jnum(x * 100, 0) for x in fc_1],
-        forecast_h=[jnum(x * 100, 0) for x in fc_h],
-        horizon=FORECAST_H,
     )
 
 
 # --------------------------------------------------------------------------- #
 # regime forecast (C2: streak-adjusted persistence) + retroactive calibration
-#   Chosen over a 4-component ensemble by measurement (Ticket 04): streak-adjusted
-#   persistence alone beat every combination (LogLoss 0.923, top-1 67.5%). Horizon
-#   is 5 trading days — behaviour features have ~zero persistence at 21d (Ticket 04b).
+#   Chosen over a 4-component ensemble by measurement: streak-adjusted persistence alone
+#   beat every combination on LogLoss (0.923). Its top-1 hit (67.5 %) is no better than
+#   naive "regime stays" (67.8 %) — the edge is in the probabilities, not the top pick.
+#   Horizon 5 trading days — behaviour features have ~zero persistence at 21d.
 # --------------------------------------------------------------------------- #
 FC_H = 5          # forecast horizon, trading days
 CAL_START = "2016-01-01"
+FAMILIES = ["CARRY", "NEUTRAL", "STRESS"]
+FAMILY_OF = {"CALM CARRY": 0, "STEADY CARRY": 0, "NEUTRAL RANGE": 1,
+             "TRANSITION": 2, "STRESS / BACKW": 2, "VOL SHOCK": 2}
 
 def _streak_bucket(s):
     return 0 if s <= 3 else (1 if s <= 10 else 2)
@@ -433,6 +455,10 @@ def forecast_block(px, labels):
         pr = off * (1 - pstay); pr[L[t]] += pstay
         return pr / pr.sum()
 
+    FAM = np.array([FAMILY_OF[r] for r in REG_ORDER])
+    def fam_dist(pr):
+        return np.array([pr[FAM == k].sum() for k in range(len(FAMILIES))])
+
     journal, cal = [], []
     for t in range(n):
         while nxt + FC_H <= t:                 # fold in every resolved pair s -> s+H
@@ -443,7 +469,9 @@ def forecast_block(px, labels):
         if t >= cal_start_pos and t + FC_H < n:
             pr = dist_at(t)
             top = int(np.argmax(pr))
-            cal.append((float(pr[top]), int(top == L[t + FC_H])))
+            fd = fam_dist(pr); ft = int(np.argmax(fd))
+            cal.append((float(pr[top]), int(top == L[t + FC_H]),
+                        float(fd[ft]), int(ft == FAM[L[t + FC_H]]), int(L[t] == L[t + FC_H])))
 
     # current forecast (counters now hold every resolved pair up to today)
     t = n - 1
@@ -452,22 +480,40 @@ def forecast_block(px, labels):
     top, second = int(order[0]), int(order[1])
     fc = [jnum(x * 100, 1) for x in pr]
 
-    # retroactive calibration curve
-    cdf = pd.DataFrame(cal, columns=["conf", "hit"])
+    # retroactive calibration curve. err/bias are computed from the ROUNDED shown values so
+    # the table reconciles on screen; ECE (bucket-weighted |acc - conf|) replaces the old
+    # "quality" score, which mostly measured irreducible Bernoulli noise.
+    cdf = pd.DataFrame(cal, columns=["conf", "hit", "fconf", "fhit", "stay"])
+    def calib(conf, hit, edges):
+        out, ece = [], 0.0
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            m = (conf >= lo) & (conf < hi)
+            k = int(m.sum())
+            if k:
+                c_, a_ = round(conf[m].mean() * 100), round(hit[m].mean() * 100)
+                ece += k / len(conf) * abs(hit[m].mean() - conf[m].mean()) * 100
+                out.append(dict(bucket=f"{int(lo*100)}-{min(int(hi*100), 100)}%", n=k, conf=c_, acc=a_, err=a_ - c_))
+            else:
+                out.append(dict(bucket=f"{int(lo*100)}-{min(int(hi*100), 100)}%", n=0, conf=None, acc=None, err=None))
+        return out, ece
     edges = [0.30, 0.50, 0.70, 0.90, 1.01]
-    labels_b = ["30-50%", "50-70%", "70-90%", "90-100%"]
-    buckets = []
-    for lo, hi, nm in zip([0.30, 0.50, 0.70, 0.90], edges[1:], labels_b):
-        m = (cdf["conf"] >= lo) & (cdf["conf"] < hi)
-        sub = cdf[m]
-        buckets.append(dict(bucket=nm, n=int(len(sub)),
-                            conf=jnum(sub["conf"].mean() * 100, 0) if len(sub) else None,
-                            acc=jnum(sub["hit"].mean() * 100, 0) if len(sub) else None,
-                            err=jnum((sub["hit"].mean() - sub["conf"].mean()) * 100, 0) if len(sub) else None))
-    ov_conf = float(cdf["conf"].mean()) if len(cdf) else 0.0
-    ov_acc = float(cdf["hit"].mean()) if len(cdf) else 0.0
-    bias_pp = (ov_acc - ov_conf) * 100
-    quality = int(round(100 - min(abs(bias_pp) + cdf.assign(e=(cdf["hit"] - cdf["conf"]).abs())["e"].mean() * 100 if len(cdf) else 100, 100)))
+    buckets, ece = calib(cdf["conf"], cdf["hit"], edges)
+    ov_conf = round(float(cdf["conf"].mean()) * 100) if len(cdf) else 0
+    ov_acc = round(float(cdf["hit"].mean()) * 100) if len(cdf) else 0
+    bias_pp = ov_acc - ov_conf
+    # noise band for the overall bias: 5-day targets overlap, so ~n/FC_H independent outcomes
+    se_pp = float(cdf["hit"].std() / math.sqrt(max(len(cdf) / FC_H, 1)) * 100) if len(cdf) else 0.0
+    base_acc = round(float(cdf["stay"].mean()) * 100) if len(cdf) else 0
+    # family readout (carry / neutral / stress): summed C2 probabilities, no new model.
+    # Measured 2016+ (2026-10-06, pre-registered): top-1 85 % vs 67 % six-way, ECE 0.6 pp,
+    # log loss within 0.001 of a family-native refit -> summing is adequate.
+    fbuckets, fece = calib(cdf["fconf"], cdf["fhit"], [0.30, 0.50, 0.70, 0.90, 1.01])
+    f_now = fam_dist(dist_at(n - 1))
+    fam = dict(names=FAMILIES, dist=[jnum(x * 100, 1) for x in f_now],
+               top=FAMILIES[int(np.argmax(f_now))], top_prob=jnum(float(f_now.max()) * 100, 1),
+               acc=round(float(cdf["fhit"].mean()) * 100) if len(cdf) else None,
+               conf=round(float(cdf["fconf"].mean()) * 100) if len(cdf) else None,
+               ece=jnum(fece, 1), buckets=fbuckets)
 
     # journal: last ~15 days, each forecast made with counters strictly up to that day
     # (last FC_H are PENDING — no resolved actual yet). Fresh causal replay.
@@ -495,10 +541,12 @@ def forecast_block(px, labels):
     return dict(horizon=FC_H, order=REG_ORDER, colors=[REG_COLOR[l] for l in REG_ORDER],
                 dist=fc, top=REG_ORDER[top], top_prob=jnum(float(pr[top]) * 100, 1),
                 second=REG_ORDER[second], second_prob=jnum(float(pr[second]) * 100, 1),
-                calib=dict(buckets=buckets, bias_pp=jnum(bias_pp, 0), quality=quality,
-                           overall_conf=jnum(ov_conf * 100, 0), overall_acc=jnum(ov_acc * 100, 0),
-                           bias="Overconfident" if bias_pp < 0 else "Underconfident", n=int(len(cdf))),
-                journal=journal, cal_from=CAL_START[:4])
+                calib=dict(buckets=buckets, bias_pp=bias_pp, ece=jnum(ece, 1), se_pp=jnum(se_pp, 1),
+                           overall_conf=ov_conf, overall_acc=ov_acc, base_acc=base_acc,
+                           bias=("within noise" if abs(bias_pp) < 2 * se_pp else
+                                 "Overconfident" if bias_pp < 0 else "Underconfident"),
+                           n=int(len(cdf))),
+                family=fam, journal=journal, cal_from=CAL_START[:4])
 
 
 # --------------------------------------------------------------------------- #
@@ -562,10 +610,18 @@ def forward_test(px, labels, fc):
     clean = [r for r in resolved if r["inputs"] == "complete"]
     clean_hits = sum(1 for r in clean if r["status"] == "HIT")
     lagged = [r for r in rows if r["inputs"] == "lagged"]
+    # yardsticks: naive "regime stays", the model's own promise (sum of logged top
+    # probabilities), and the family of the predicted regime (carry/neutral/stress).
+    base_hits = sum(1 for r in resolved if r["actual"] == r["regime"])
+    expected = sum(float(r["prob"]) for r in resolved) / 100.0
+    fam_hits = sum(1 for r in resolved if FAMILY_OF.get(r["actual"]) == FAMILY_OF.get(r["pred"]))
+    all_stay = all(r["pred"] == r["regime"] for r in rows)
     recent = list(reversed(rows[-15:]))
     return dict(since=rows[0]["date"] if rows else today, n_logged=len(rows),
                 n_resolved=len(resolved), n_pending=len(pending),
                 hits=hits, hit_rate=jnum(hits / len(resolved) * 100, 0) if resolved else None,
+                base_hits=base_hits, expected=jnum(expected, 1), fam_hits=fam_hits,
+                all_stay=all_stay, n_indep=len(resolved) // FC_H,
                 n_clean=len(clean), clean_hits=clean_hits,
                 clean_rate=jnum(clean_hits / len(clean) * 100, 0) if clean else None,
                 n_lagged=len(lagged), lagged_until=lagged[-1]["date"] if lagged else None,
@@ -587,12 +643,22 @@ def validation_block(vrp_now30, vrp_hist30):
                             hit=jnum((df["out"][m] > 0).mean() * 100, 0)))
     out = df["out"]
     mean, sd = out.mean(), out.std()
-    return dict(buckets=buckets,
+    outs = [b["out"] for b in buckets]
+    mono = all(outs[i] >= outs[i - 1] for i in range(1, len(outs)))
+    # forward VRP-30 overlaps ~21x: rank-IC on the 21 non-overlapping phases, n_eff = n/21
+    k = trading_days(30)
+    ics = [df.iloc[o::k].corr(method="spearman").iloc[0, 1] for o in range(k)]
+    neg = df[df["sig"] < 0]["out"]
+    return dict(buckets=buckets, mono=mono, best_q=int(np.argmax(outs)) + 1,
                 mean=jnum(mean, 2), std=jnum(sd, 2),
                 info_ratio=jnum(mean / sd, 2) if sd else None,
                 hit=jnum((out > 0).mean() * 100, 0),
                 worst=jnum(out.min(), 1), best=jnum(out.max(), 1),
-                n=int(len(out)))
+                n=int(len(out)), n_eff=int(len(out) // k),
+                ic_med=jnum(float(np.median(ics)), 3), ic_lo=jnum(float(min(ics)), 3),
+                ic_hi=jnum(float(max(ics)), 3), ic_pos=int(sum(i > 0 for i in ics)), ic_k=k,
+                neg_n=int(len(neg)), neg_out=jnum(neg.mean(), 2) if len(neg) else None,
+                neg_pos=jnum((neg > 0).mean() * 100, 0) if len(neg) else None)
 
 
 # --------------------------------------------------------------------------- #
@@ -615,12 +681,14 @@ def analog_block(px, labels):
         "rvc":  (r.rolling(10).std() - r.rolling(63).std()) * ann,
         "er21": (p - p.shift(21)).abs() / p.diff().abs().rolling(21).sum(),
     }).dropna()
-    # causal percentile-rank normalisation (expanding). For today's query the final
-    # expanding state == full-history rank, which is correct for the last row.
+    # percentile-rank normalisation over the full history (today's query is ranked against
+    # everything up to today — no future enters the query; neighbours' ranks also use it).
     Z = feats.rank(pct=True).to_numpy()
     idx = feats.index
     n = len(idx)
-    maxh = max(ANALOG_HORIZONS)
+    # horizons are DTE (calendar days) like everywhere else -> sessions via trading_days()
+    hrow = {h: trading_days(h) for h in ANALOG_HORIZONS}
+    maxh = max(hrow.values())
     q = Z[-1]
     # eligible neighbours: complete forward window, exclude the last maxh rows and today
     elig = np.arange(0, n - maxh)
@@ -637,8 +705,8 @@ def analog_block(px, labels):
 
     per_h = []
     for h in ANALOG_HORIZONS:
-        rets = np.array([P[s + h] / P[s] - 1 for s in order]) * 100
-        per_h.append(dict(h=h, matches=len(order),
+        rets = np.array([P[s + hrow[h]] / P[s] - 1 for s in order]) * 100
+        per_h.append(dict(h=h, sess=hrow[h], matches=len(order),
                           avg=jnum(np.nanmean(rets), 2), med=jnum(np.nanmedian(rets), 2),
                           worst=jnum(np.nanmin(rets), 1), best=jnum(np.nanmax(rets), 1),
                           pos=jnum((rets > 0).mean() * 100, 0)))
@@ -663,6 +731,42 @@ def analog_block(px, labels):
                          vv3m=jnum(float(feats["vv3m"].iloc[-1]), 3),
                          rvc=jnum(float(feats["rvc"].iloc[-1]), 2),
                          er21=jnum(float(feats["er21"].iloc[-1]), 2)))
+
+
+# --------------------------------------------------------------------------- #
+# expected move: IV-implied 1-sigma band per DTE, next to its MEASURED coverage
+#   Pre-registered test (2026-10-06): if measured 1-sigma coverage differs from the
+#   nominal 68.3 % by >= 5 pp with the same sign in 2011-18 and 2019-26, it must be shown
+#   next to the band. Result: 80-85 % in both halves at every DTE -> shown. Up/down
+#   breach asymmetry and per-regime columns did NOT pass -> not shown.
+# --------------------------------------------------------------------------- #
+def expected_move_block(px, series):
+    S = px["SPX"]
+    spot = float(S.iloc[-1])
+    half = S.index < "2019-01-01"
+    rows = []
+    for d in DTES:
+        n = trading_days(d)
+        iv = series[d]["iv"] / 100.0
+        sd = iv * math.sqrt(d / 365.0)                       # 1-sigma log move to expiry
+        z = (np.log(S.shift(-n) / S) / sd).dropna()
+        h = half[S.index.get_indexer(z.index)]              # True = 2011-18
+        kp = np.exp(0.5 * sd ** 2 - Z16P * sd)               # 16-delta strikes, ATM vol, r = q
+        kc = np.exp(0.5 * sd ** 2 - Z16C * sd)
+        fwd = (S.shift(-n) / S).reindex(z.index)
+        cur_sd = float(sd.iloc[-1])
+        rows.append(dict(
+            dte=d, sess=n, iv=jnum(float(iv.iloc[-1]) * 100, 1),
+            move=jnum(spot * cur_sd, 0), lo=jnum(spot * math.exp(-cur_sd), 0), hi=jnum(spot * math.exp(cur_sd), 0),
+            p16=jnum(spot * float(kp.iloc[-1]), 0), c16=jnum(spot * float(kc.iloc[-1]), 0),
+            n=int(len(z)), cover=jnum(float((z.abs() <= 1).mean()) * 100, 1),
+            cover_h1=jnum(float((z[h].abs() <= 1).mean()) * 100, 1),
+            cover_h2=jnum(float((z[~h].abs() <= 1).mean()) * 100, 1),
+            below=jnum(float((z < -1).mean()) * 100, 1), above=jnum(float((z > 1).mean()) * 100, 1),
+            put16=jnum(float((fwd < kp.reindex(z.index)).mean()) * 100, 1),
+            call16=jnum(float((fwd > kc.reindex(z.index)).mean()) * 100, 1),
+            beyond2=jnum(float((z < -2).mean()) * 100, 1), worst_z=jnum(float(z.min()), 1)))
+    return dict(spot=jnum(spot, 2), rows=rows)
 
 
 # --------------------------------------------------------------------------- #
@@ -768,12 +872,26 @@ def backtest_block(px, iv30, labels, vrp_now30, rate):
     gated  = np.array([l in CALM_REGIMES for l in lab])
     gm     = [bool(gated[i]) for i in steps]
 
+    def phases(pnl, cadence, mask_full=None):
+        """Total / max-drawdown of the non-overlapping trade sequence for EVERY entry
+        phase (offset 0..cadence-1). One phase alone is an arbitrary draw: measured
+        2026-10-06 the straddle total ran 108..191 % across the 21 phases."""
+        tots, mdds = [], []
+        for o in range(cadence):
+            st_o = range(o, len(pnl), cadence)
+            m = None if mask_full is None else [bool(mask_full[i]) for i in st_o]
+            _, t_, d_ = _equity([pnl[i] for i in st_o], None, m)
+            tots.append(t_); mdds.append(d_)
+        return dict(tot=jnum(float(np.median(tots)), 1), tot_lo=jnum(min(tots), 1), tot_hi=jnum(max(tots), 1),
+                    mdd=jnum(float(np.median(mdds)), 1), mdd_lo=jnum(min(mdds), 1), mdd_hi=jnum(max(mdds), 1),
+                    ann=jnum(float(np.median(tots)) / yrs, 1), k=cadence)
+
     def one(pnl, mask_steps=None, mask_full=None):
         ps = [pnl[i] for i in steps]
-        eq, tot, mdd = _equity(ps, ds, mask_steps)
+        eq, _, _ = _equity(ps, ds, mask_steps)            # display curve = phase 1
         st = _stats(pnl if mask_full is None else pnl[mask_full])
         n  = len(steps) if mask_steps is None else int(np.sum(mask_steps))
-        return dict(stats=st, eq=eq, tot=tot, mdd=mdd, ann=jnum(tot / yrs, 1), n=n)
+        return dict(stats=st, eq=eq, n=n, **phases(pnl, n_exp, mask_full))
 
     def make(fn):
         out = {}
@@ -813,8 +931,6 @@ def backtest_block(px, iv30, labels, vrp_now30, rate):
     def cal_entry(mask_steps=None, mask_full=None):
         """Calendar runs on its own 6-session cadence; totals/mdd are cadence-true,
         the display equity is resampled onto the shared 21-session date grid."""
-        ps = [pnl_cal[i] for i in steps_c]
-        _, tot, mdd = _equity(ps, ds_c, mask_steps)
         eq, run, j = [], 0.0, 0
         for pos in steps:
             while j < len(steps_c) and steps_c[j] <= pos:
@@ -825,7 +941,7 @@ def backtest_block(px, iv30, labels, vrp_now30, rate):
             eq.append(round(run, 2))
         st = _stats(pnl_cal if mask_full is None else pnl_cal[mask_full])
         n = len(steps_c) if mask_steps is None else int(np.sum(mask_steps))
-        return dict(stats=st, eq=eq, tot=tot, mdd=mdd, ann=jnum(tot / yrs, 1), n=n)
+        return dict(stats=st, eq=eq, n=n, **phases(pnl_cal, n_f, mask_full))
 
     calv = dict(all=cal_entry(), gated=cal_entry(gm_c, gated_c))
     structures["Calendar 9/30 (ATM call)"] = {"flat": calv, "skew": calv}  # ATM -> skew-invariant
@@ -888,7 +1004,7 @@ def build_data(px):
 
     term = [{"lbl": lbl, "v": jnum(float(px[col].iloc[-1]), 2)}
             for lbl, col in [("9d", "^VIX9D"), ("30d", "^VIX"), ("3M", "^VIX3M"), ("6M", "^VIX6M")]
-            if not np.isnan(px[col].iloc[-1])]
+            if pd.notna(px[col].iloc[-1])]
 
     tail = px.tail(CHART_TAIL)
     ti   = tail.index
@@ -909,9 +1025,17 @@ def build_data(px):
 
     fc_block = forecast_block(px, labels)
     src = px.attrs.get("sources", [])
+    # stale-after instant, decided here (the page only compares it with the clock — no
+    # time-zone or weekday arithmetic in the viewer). The build runs Mon-Sat 11:00 UTC for
+    # the previous session; expected = next weekday after as-of, 11:00 UTC. Grace = two
+    # more weekdays (one exchange holiday + one failed run) + 6 h for a delayed cron.
+    exp = px.index[-1] + pd.offsets.BDay(1)
+    stale_after = exp + pd.offsets.BDay(2) + pd.Timedelta(hours=11 + 6)
     return dict(
         asof=px.index[-1].strftime("%d %b %Y"),
         asof_iso=px.index[-1].strftime("%Y-%m-%d"),
+        stale_after_utc=stale_after.strftime("%Y-%m-%dT%H:%M:00Z"),
+        expected_utc=(exp + pd.Timedelta(hours=11)).strftime("%a %d %b %H:%M UTC"),
         first=px.index[0].strftime("%d %b %Y"),
         n_total=len(px),
         sources=src, n_ok=sum(1 for s in src if s["ok"]),
@@ -928,6 +1052,7 @@ def build_data(px):
         forecast=fc_block,
         forward=forward_test(px, labels, fc_block),
         analog=analog_block(px, labels),
+        expected=expected_move_block(px, series),
         validation=validation_block(series[30]["vrp_now"], series[30]["vrp_hist"]),
         backtest=backtest_block(px, series[30]["iv"], labels, series[30]["vrp_now"], rate),
         matrix=vrp_matrix_block(series),
@@ -1146,8 +1271,8 @@ TEMPLATE = r"""<meta charset="utf-8">
   <div class="strip status">
     <span class="live" id="s-live"></span>
     <span id="s-src"></span>
-    <span>REGIME <span class="regime" id="s-regime"></span></span>
-    <span class="lbl" id="s-slope" style="margin:0" data-tip="Slope = VIX3M ÷ VIX: >1 contango (calm, carry-friendly), <1 backwardation (stress). Plus VIX percentile vs full history, SPX vs its 200-day average, and the 20-day return."></span>
+    <span>REGIME <span class="regime" id="s-regime"></span> <span class="lbl" id="s-run" style="margin:0"></span></span>
+    <span class="lbl" id="s-slope" style="margin:0" data-tip="Slope = VIX3M ÷ VIX: ≥1 contango (carry-friendly), <1 backwardation; below 0.97 the STRESS rule fires. Plus VIX percentile vs full history, SPX vs its 200-day average, and the 20-day return."></span>
   </div>
 
   <div class="panel active" data-panel="overview">
@@ -1159,12 +1284,15 @@ TEMPLATE = r"""<meta charset="utf-8">
         <div class="ctx-meta" id="ctx-meta"></div>
       </div>
       <div class="ctx-cols">
-        <div class="col fav"><div class="col-h" data-tip="Historically paid in the current regime — measured thresholds: mean ≥0.3%/trade and win ≥65% (short vol), analogous per family. Not a trade instruction.">FAVORED / WATCH</div><div id="col-fav"></div></div>
+        <div class="col fav"><div class="col-h" data-tip="Historically paid in the current regime — hand-set cut-offs on measured stats: mean ≥0.3%/trade and win ≥65% (short vol), analogous per family. Not a trade instruction.">FAVORED / WATCH</div><div id="col-fav"></div></div>
         <div class="col acc"><div class="col-h" data-tip="Mixed or ≈zero historical record in this regime — usable, but context dependent.">ACCEPTABLE / CONTEXT DEPENDENT</div><div id="col-acc"></div></div>
         <div class="col cau"><div class="col-h" data-tip="Historically weak in this regime, or the measured risk profile argues against aggression.">CAUTION / AVOID AGGRESSION</div><div id="col-cau"></div></div>
       </div>
       <div class="hist" id="ctx-hist"></div>
     </div>
+    <div class="box"><div class="box-title" id="em-title"></div>
+      <div style="overflow-x:auto"><table class="tbl" id="em-tbl"><thead><tr><th>DTE</th><th>IV</th><th>±1σ move</th><th>1σ range</th><th>16Δ put · call (≈)</th><th data-tip="Share of past entries (since 2011) where SPX closed inside the then-implied ±1σ range at expiry. Nominal for a fair price: 68.3%.">Inside ±1σ, measured</th><th data-tip="Same, split 2011–18 · 2019–26 — the excess held in both halves.">2011–18 · 2019–26</th><th data-tip="Share of entries where SPX finished below the then-16Δ put / above the 16Δ call strike. Black-Scholes nominal ≈16% each.">Finished past 16Δ put · call</th><th data-tip="Share of entries that ended below −2σ (nominal 2.3%), and the worst outcome in σ units.">Below −2σ · worst</th></tr></thead><tbody></tbody></table></div>
+      <div class="box-note" id="em-note"></div></div>
   </div>
 
   <div class="panel" data-panel="matrix">
@@ -1181,6 +1309,8 @@ TEMPLATE = r"""<meta charset="utf-8">
 
   <div class="panel" data-panel="regime">
     <div class="box"><div class="box-title">▶ CURRENT REGIME</div><div class="reg-grid" id="reg-grid"></div></div>
+    <div class="box"><div class="box-title">▶ VIX TERM STRUCTURE · as of the report date</div><div id="term-snap" style="max-width:560px"></div>
+      <div class="box-note">Constant-maturity Cboe indices: VIX9D · VIX (30d) · VIX3M · VIX6M. Upward sloping = contango.</div></div>
     <div class="box"><div class="box-title" id="reg-tbl-title"></div>
       <table class="tbl" id="reg-tbl"><thead><tr><th>Regime</th><th>Days (full)</th><th>Avg VRP (full)</th><th>Hit (full)</th><th>Avg VRP (window)</th><th>Hit (window)</th></tr></thead><tbody></tbody></table>
       <div class="box-note" id="reg-tbl-note"></div></div>
@@ -1191,10 +1321,10 @@ TEMPLATE = r"""<meta charset="utf-8">
       <table class="tbl" id="val-tbl"><thead><tr><th>Quintile</th><th>N</th><th>Avg signal (nowcast VRP)</th><th>Avg forward VRP</th><th>Hit rate</th></tr></thead><tbody></tbody></table>
       <div class="box-note" id="val-note"></div></div>
     <div class="box"><div class="box-title" id="eq-title"></div><div id="chart-eq"></div>
-      <div class="box-note">Overlapping ~21-day short-vol trades, 1 per day, P&L in vol points (illustrative — overlapping windows, no costs/vega scaling).</div></div>
+      <div class="box-note">Overlapping ~21-day short-vol trades, 1 per day, P&L in vol points (illustrative — overlapping windows, no costs/vega scaling). <span id="eq-mdd"></span></div></div>
     <div class="grid2" style="margin-top:0">
       <div class="box"><div class="box-title">▶ SUMMARY (full history)</div><div class="kvlist" id="val-sum"></div></div>
-      <div class="box"><div class="box-title">▶ READING IT</div><div class="box-note" style="font-size:11.5px">A monotone rise in "Avg forward VRP" across quintiles means the current-VRP signal has genuine forward information: when IV looks rich vs recent realized, subsequent captured premium is higher. A flat/noisy pattern means little edge.</div></div>
+      <div class="box"><div class="box-title">▶ READING IT</div><div class="box-note" style="font-size:11.5px">A monotone rise in "Avg forward VRP" across <i>all</i> quintiles would mean the current-VRP signal has graded forward information: when IV looks rich vs recent realized, subsequent captured premium is higher. A U-shape or noisy pattern means little graded edge. Forward VRP-30 windows overlap ~21×, so the day count overstates the independent evidence.</div></div>
     </div>
 
     <div class="box"><div class="box-title" id="an-title"></div>
@@ -1204,8 +1334,8 @@ TEMPLATE = r"""<meta charset="utf-8">
       <table class="tbl" id="an-h"><thead><tr><th>Horizon</th><th>Matches</th><th>Avg SPX return</th><th>Median</th><th>Worst</th><th>Best</th><th>Positive %</th></tr></thead><tbody></tbody></table>
       <div class="box-note" id="an-h-note"></div></div>
     <div class="box"><div class="box-title">▶ TOP ANALOG DAYS · nearest neighbours in state space</div>
-      <table class="tbl" id="an-top"><thead><tr><th>Date</th><th>Regime</th><th>Distance</th><th>Similarity</th><th>VIX</th><th>21d SPX ret</th><th>21d fwd RV</th></tr></thead><tbody></tbody></table>
-      <div class="box-note">Similarity is a display transform of distance, <b>not a probability</b>. Neighbours use only observable state (VIX level, term structure, RV composite, 21-day efficiency) and are restricted to days with a complete forward window.</div></div>
+      <table class="tbl" id="an-top"><thead><tr><th>Date</th><th>Regime</th><th>Distance</th><th>Similarity</th><th>VIX</th><th>SPX ret · 21 sess.</th><th>Fwd RV · 21 sess.</th></tr></thead><tbody></tbody></table>
+      <div class="box-note">The similarity column only rescales distance for display (0–100 within this neighbour set); it is <b>not a likelihood</b>. Neighbours use only observable state (VIX level, term structure, rv10−rv63 spread, 21-day efficiency) and are restricted to days with a complete 21-session forward window.</div></div>
   </div>
 
   <div class="panel" data-panel="backtest">
@@ -1233,6 +1363,9 @@ TEMPLATE = r"""<meta charset="utf-8">
   <div class="panel" data-panel="timeline">
     <div class="box"><div class="box-title" id="tl-title"></div><div id="ribbon"></div><div class="legend" id="tl-leg"></div>
       <div class="box-note">Each vertical band = the rule-based regime on that day. Rules are shown in the Regime Analysis / Settings tabs.</div></div>
+    <div class="box"><div class="box-title">▶ REGIME CHANGE LOG · last 12 label changes · full history</div>
+      <table class="tbl" id="tl-log"><thead><tr><th>Date</th><th>From</th><th>To</th><th>Run length (sessions)</th></tr></thead><tbody></tbody></table>
+      <div class="box-note" id="tl-log-note"></div></div>
   </div>
 
   <div class="panel" data-panel="forecast">
@@ -1240,7 +1373,7 @@ TEMPLATE = r"""<meta charset="utf-8">
       <div class="box-note" style="margin-top:0" id="fc-sub"></div>
       <div class="reg-grid" id="fc-cards" style="margin-top:10px"></div></div>
     <div class="box"><div class="box-title" id="fc-title"></div><div id="fc-bars"></div>
-      <div class="box-note">Next-regime probabilities over the forecast horizon. Model = streak-adjusted persistence (P(stay | regime, streak bucket), remainder from the transition off-diagonal) — chosen over a 4-component ensemble by measurement (LogLoss 0.923). A regime-state estimate, <b>not</b> a forecast of SPX, VIX, returns or trade profitability.</div></div>
+      <div class="box-note">Next-regime probabilities over the forecast horizon. Model = streak-adjusted persistence (P(stay | regime, streak bucket), remainder from the transition off-diagonal) — chosen over a 4-component ensemble by measurement (LogLoss 0.923). FAMILY sums the probabilities into carry (CALM+STEADY) · neutral · stress (TRANSITION+STRESS+SHOCK) — same model, no new parameter. A regime-state estimate, <b>not</b> a forecast of SPX, VIX, returns or trade profitability; a high carry probability is not a short-vol signal (measured: calm, persistent carry precedes thinner premium).</div></div>
     <div class="box"><div class="box-title" id="fc-cal-title"></div>
       <table class="tbl" id="fc-cal"><thead><tr><th>Forecast confidence</th><th>N</th><th>Avg confidence</th><th>Actual accuracy</th><th>Calibration error</th></tr></thead><tbody></tbody></table>
       <div class="box-note" id="fc-cal-note"></div></div>
@@ -1273,17 +1406,18 @@ TEMPLATE = r"""<meta charset="utf-8">
 
     <div class="box"><div class="box-title">▶ READING THE NUMBERS — WHAT MATTERS, WHAT DOESN'T</div>
       <table class="tbl"><thead><tr><th>Value</th><th>What it tells you</th><th>Rule of thumb</th></tr></thead><tbody>
-        <tr><td>CUR VRP</td><td>Is there premium to sell at all?</td><td class="good">&gt; 0 required — below 0, selling premium fights the data</td></tr>
+        <tr><td>CUR VRP</td><td>Is IV above recent realized vol?</td><td class="good">&gt; 0 is the normal case · &lt; 0 usually follows an RV spike — historically weaker, not negative (Validation tab)</td></tr>
         <tr><td>VRP PCT</td><td>Richness vs its own history</td><td>≥ 60th = rich · ≤ 30th = thin, patience is a position</td></tr>
-        <tr><td>HIT RATE</td><td>How often selling won historically</td><td class="warn">~80% is NORMAL here — never read it as safety; losses are far larger than wins</td></tr>
-        <tr><td>WORST / p5</td><td>Size of the left tail</td><td class="bad">THE critical number — position sizing derives from it (next box)</td></tr>
+        <tr><td>HIT RATE</td><td>How often IV exceeded later realized vol (vol points)</td><td class="warn">~80–85% is NORMAL here — never read it as safety; trade win rates are lower and losses far larger than wins</td></tr>
+        <tr><td>Backtest WORST / p5</td><td>Size of the left tail, % of notional</td><td class="bad">THE critical number — position sizing derives from it (next box). The card WORST is the same idea in vol points</td></tr>
         <tr><td>COMPOSITE</td><td>Premium quality/safety across DTEs</td><td>A ranking of <i>safety</i>, NOT expected P&amp;L — measured, calm conditions precede weaker short-vol returns (complacency). Read <i>why</i> via the five bars</td></tr>
-        <tr><td>Slope VIX3M/VIX</td><td>Term-structure state</td><td>≥ 1 contango = carry-friendly · &lt; 0.97 backwardation = stress dynamics</td></tr>
-        <tr><td>Validation quintiles</td><td>Does a richer signal pay more forward?</td><td>Rising Q1→Q5 = the signal carries real information</td></tr>
-        <tr><td>RV COMPOSITE</td><td>rv10 − rv63: realized vol accelerating?</td><td class="warn">&gt; 0 in CALM/STEADY = measured drag on short vol (Ticket 02). No signal in TRANSITION (sign flips)</td></tr>
-        <tr><td>Forecast reliability</td><td>Is the regime forecast well-calibrated?</td><td>Confidence vs actual accuracy per bucket; the tool shows its own bias openly (retroactive replay)</td></tr>
+        <tr><td>Slope VIX3M/VIX</td><td>Term-structure state</td><td>≥ 1 contango = carry-friendly · &lt; 1 backwardation · &lt; 0.97 = STRESS rule</td></tr>
+        <tr><td>Validation quintiles</td><td>Does a richer signal pay more forward?</td><td>A rise across <i>all</i> of Q1→Q5 would mean graded information; the verdict line says whether it holds</td></tr>
+        <tr><td>RV SPREAD</td><td>rv10 − rv63: realized vol accelerating?</td><td class="warn">&gt; 0 in CALM/STEADY = measured drag on short vol. No rule in TRANSITION (sign flips)</td></tr>
+        <tr><td>Expected move</td><td>IV-implied ±1σ range per DTE</td><td class="warn">SPX finished inside it far more often than 68% — that excess IS the premium; the tail beyond −2σ is the price</td></tr>
+        <tr><td>Forecast reliability</td><td>Is the regime forecast well-calibrated?</td><td>Confidence vs actual accuracy per bucket; the top pick is nearly always "regime stays" — its edge is in the probabilities</td></tr>
         <tr><td>Analog engine</td><td>What followed similar historical states?</td><td>Context, not alpha — measured fwd-RV skill only; return prediction ≈ 0</td></tr>
-        <tr><td>Regime</td><td>Which historical playbook applies</td><td class="bad">NEUTRAL RANGE is the only regime where short vol lost on average (<span id="h-nr"></span>)</td></tr>
+        <tr><td>Regime</td><td>Which historical playbook applies</td><td class="bad">NEUTRAL RANGE is the only regime where the ATM straddle lost on average (<span id="h-nr"></span>); strangle/condor were ≈ flat there</td></tr>
       </tbody></table></div>
 
     <div class="box"><div class="box-title">▶ FROM EVIDENCE TO TRADE INPUTS</div>
@@ -1293,11 +1427,11 @@ TEMPLATE = r"""<meta charset="utf-8">
         <span class="h4">WHICH TENOR (DTE)</span>
         The #1-ranked card — but check <i>why</i>: a rank driven by <b>CARRY</b> (most premium per day) is a different trade than one driven by <b>RICH</b> (statistically stretched). Treat <b>7 DTE</b> as indicative only (short-end interpolation).
         <span class="h4">WHEN</span>
-        Best measured conditions: CUR VRP positive, VRP PCT elevated, and a regime with a positive measured record (hover it). Staying flat in NEUTRAL RANGE costs nothing and skipped the only measured negative pocket.
+        Best measured conditions: VRP PCT elevated and a regime with a positive measured record (hover it). Staying flat in NEUTRAL RANGE costs little and skipped the straddle's only negative pocket.
         <span class="h4">HOW MUCH — THE CRITICAL ONE</span>
-        Size from the tail, not the average: assume the worst historical episode repeats <i>tomorrow</i>. It cost <b><span id="h-wsd2"></span>%</b> of notional; if you accept losing at most 2% of your account on that repeat, short-straddle notional must stay below ≈ <b class="warn"><span id="h-size"></span>% of the account</b>. All figures are % of spot notional — margin leverage multiplies both gain and loss.
+        Size from the tail, not the average: assume the worst episode in this sample (since 2011) repeats <i>tomorrow</i> — a worse one is possible. It cost <b><span id="h-wsd2"></span>%</b> of notional; if you accept losing at most 2% of your account on that repeat, short-straddle notional must stay below ≈ <b class="warn"><span id="h-size"></span>% of the account</b>. All figures are % of spot notional — margin leverage multiplies both gain and loss.
         <span class="h4">WHAT THE DATA SAYS NOT TO DO</span>
-        · Don't equate calm with safe — the largest losses started in CALM/STEADY regimes.<br>
+        · Don't equate calm with safe — calm conditions preceded weaker short-vol returns, and the worst single straddle loss (Feb 2020) was entered in a carry regime.<br>
         · Don't read the ~80% hit rate as safety — the payoff is asymmetric by construction.<br>
         · Don't run permanent long-vol hedges expecting them to be free — measured cost ≈ 1%/month.
       </div></div>
@@ -1305,16 +1439,17 @@ TEMPLATE = r"""<meta charset="utf-8">
     <div class="box"><div class="box-title">▶ RED FLAGS — WHEN NOT TO TRUST, WHEN NOT TO TRADE</div>
       <div class="helptext">
         <span class="bad">✗</span> Badge shows <b>DATA n/5</b> / DEGRADED → the snapshot is unreliable; fix data before reading anything.<br>
-        <span class="bad">✗</span> <b>CUR VRP &lt; 0</b> → there is no premium; short vol is negative-EV territory right now.<br>
-        <span class="bad">✗</span> Regime <b>NEUTRAL RANGE</b> → the only measured losing regime for short vol.<br>
+        <span class="warn">△</span> <b>CUR VRP &lt; 0</b> → realized vol just spiked above implied. Historically the forward premium was still mostly positive (Validation tab) but straddle returns were weaker — a path-risk warning, not an absence of premium.<br>
+        <span class="bad">✗</span> Regime <b>NEUTRAL RANGE</b> → the only regime where the ATM straddle lost on average.<br>
         <span class="bad">✗</span> <b>Slope &lt; 0.97</b> (backwardation) → stress dynamics; premium is rich but paths are violent.<br>
-        <span class="warn">△</span> <b>STAB low</b> or RV accel elevated → premium unstable; size down.<br>
+        <span class="warn">△</span> <b>STAB low</b> or RV spread &gt; 0 in a carry regime → premium unstable; size down.<br>
+        <span class="warn">△</span> Regime on <b>day 1–2</b> (UNCONFIRMED) → over 40% of all label changes reverted within two sessions.<br>
         <span class="warn">△</span> <b>VOL SHOCK</b> statistics → thin sample (~51 days); treat loosely.
       </div></div>
 
     <div class="box"><div class="box-title">▶ WHAT THIS TOOL CANNOT TELL YOU</div>
       <div class="helptext">
-        It describes history — it does not predict. The Markov forecast is a base-rate, not a signal. Backtest prices are Black-Scholes reconstructions (parametric skew, flat 2% cost, % of spot notional — not margin returns, no per-strike quotes). 7 DTE is interpolated. All numbers on this page are injected live from the current dataset and update with every refresh. None of this is investment advice — it is evidence to reason from.
+        It describes history — it does not predict. The one forward-looking piece, the 5-day regime forecast (streak-adjusted persistence), is a regime-state probability; it says nothing about SPX, VIX or P&amp;L. Backtest prices are Black-Scholes reconstructions (parametric skew, flat 2% cost, % of spot notional — not margin returns, no per-strike quotes). 7 DTE is interpolated. All numbers on this page are injected live from the current dataset and update with every refresh. None of this is investment advice — it is evidence to reason from.
       </div></div>
   </div>
 
@@ -1322,7 +1457,7 @@ TEMPLATE = r"""<meta charset="utf-8">
     <div class="box"><div class="box-title">▶ DATA SOURCES</div><div class="kvlist" id="set-src"></div></div>
     <div class="box"><div class="box-title">▶ PARAMETERS</div><div class="kvlist" id="set-par"></div></div>
     <div class="box"><div class="box-title">▶ COMPOSITE WEIGHTS (edit W in vrpx.py)</div><div class="kvlist" id="set-w"></div></div>
-    <div class="box"><div class="box-title">▶ SUB-SCORES · 5 independent axes (0–100)</div><div class="rules" id="set-subs"></div></div>
+    <div class="box"><div class="box-title">▶ SUB-SCORES · five axes (0–100)</div><div class="rules" id="set-subs"></div></div>
     <div class="box"><div class="box-title">▶ REGIME RULES</div><div class="rules" id="set-rules"></div></div>
   </div>
 
@@ -1349,16 +1484,16 @@ const el=id=>document.getElementById(id);
 const TIP={
   RICH:"Richness — percentile of the current VRP within this DTE's own trailing history. High = implied vol rich vs its own norm.",
   CARRY:"Carry per day — VRP ÷ calendar days, ranked across the four DTEs (min–max). Which tenor pays the most premium per day right now.",
-  SAFETY:"Safety — merged reliability (info ratio) + tail-safety (1−|CVaR₅|) of forward VRP. These two measured the same thing (Spearman +0.89) so they are one axis. Higher = consistent edge with a milder left tail.",
+  SAFETY:"Safety — merged reliability (info ratio) + tail-safety (1 − max(−CVaR₅,0)/50) of forward VRP. These two measured the same thing (Spearman +0.89) so they are one axis. Higher = consistent edge with a milder left tail.",
   PATH:"Path-safety — trailing mean Max Adverse Excursion of the SPX path over the forward window, percentile of recent (21d) path risk within this DTE's own window history, inverted. High = the price path has been mild lately vs its norm (the path, not the VRP outcome).",
   STAB:"Stability — how steady recent VRP (21 sessions) is vs the whole window's dispersion. High = calm, predictable premium.",
   "CUR IV":"Implied vol for this DTE, interpolated from the VIX term structure (total-variance method). 7 DTE holds flat below the 9-day node.",
-  "CUR VRP":"Nowcast VRP = current IV − trailing realized vol. Positive = options currently priced rich vs recent market movement.",
-  "VRP PCT":"Where today's VRP sits in the trailing lookback distribution of forward VRP. 80th = richer than 80% of history.",
-  "HIT RATE":"Share of lookback history where IV exceeded subsequently realized vol — how often short premium ended ahead, in vol points.",
-  WORST:"Worst episode in the window: most negative forward VRP (realized vol exploded past implied). This DTE's left tail.",
+  "CUR VRP":"Nowcast VRP = current IV − trailing realized vol, in vol points. Positive = options currently priced rich vs recent market movement.",
+  "VRP PCT":"Where today's nowcast VRP sits among the nowcasts of the lookback window. 80th = richer than 80% of the window.",
+  "HIT RATE":"Share of the lookback window in which IV exceeded the subsequently realized vol (vol points). Not a trade win rate — those are in the Backtest tab and are lower.",
+  WORST:"Most negative forward VRP in the window, in vol points (realized vol exploded past implied). This DTE's left tail — not a P&L %; sizing uses the Backtest tab.",
   STABILITY:"0–100: steadiness of recent VRP vs the window's dispersion (same measure as the STAB bar).",
-  COMPOSITE:"Weighted blend of the five sub-score axes (weights & definitions in Settings). Higher = historically more attractive premium-selling conditions at this DTE."
+  COMPOSITE:"Weighted blend of the five sub-scores (weights & definitions in Settings). Ranks premium quality/safety across DTEs — NOT expected P&L (calm, safe-looking conditions measurably precede weaker short-vol returns)."
 };
 const REGTIP={
   "CALM CARRY":"Rule: slope ≥1.05 & SPX above 200d MA & VIX <17 — quiet contango bull. Caution: the largest historical short-vol losses started here.",
@@ -1424,10 +1559,10 @@ function cardHTML(c,rank,color,best,weak){
     <div class="comp-lbl" data-tip="${TIP.COMPOSITE}">COMPOSITE /100 · RANK #${rank}</div>
     <div class="metrics">
       ${mRow("CUR IV",`<span class="mv">${num(c.cur_iv,1,"%")}</span>`)}
-      ${mRow("CUR VRP",`<span class="mv ${neg}">${num(c.cur_vrp,1,"%")}</span>`)}
+      ${mRow("CUR VRP",`<span class="mv ${neg}">${num(c.cur_vrp,1," pts")}</span>`)}
       ${mRow("VRP PCT",`<span class="mv">${ord(c.vrp_pct)}</span>`)}
       ${mRow("HIT RATE",`<span class="mv">${num(c.hit,0,"%")}</span>`)}
-      ${mRow("WORST",`<span class="mv neg">${num(c.worst,1,"%")}</span>`)}
+      ${mRow("WORST",`<span class="mv neg">${num(c.worst,1," pts")}</span>`)}
       ${mRow("STABILITY",`<span class="mv">${num(s.stab,0)}/100</span>`)}</div>
     <div class="bars">${barRow("RICH",s.rich)}${barRow("CARRY",s.carry)}${barRow("SAFETY",s.safety)}${barRow("PATH",s.path)}${barRow("STAB",s.stab)}</div></div>`;
 }
@@ -1435,41 +1570,35 @@ function cardHTML(c,rank,color,best,weak){
 function slice(a,n){return a.slice(-n);}
 
 /* ---- regime -> option-strategy suitability.
-   Short-vol families: assignment DRIVEN BY MEASURED per-regime backtest stats
-   (straddle proxy, flat pricing) with explicit thresholds shown in the evidence.
-   Calendars / long vol: mechanics-based, labelled as not backtested here. ---- */
+   Every row is classified from ITS OWN structure's per-regime backtest stats (flat
+   pricing, all daily entries) with hand-set cut-offs shown in ctx-sub. ---- */
 function tradeContext(c,reg){
-  const sl=reg.slope,slt=reg.slope_txt,vix=reg.vix,vixp=reg.vix_pct,front=reg.front,
-    r20=reg.ret20,R=reg.label,rvCalm=reg.rv_calm;
-  const calm=R==='CALM CARRY'||R==='STEADY CARRY',
-        stress=R==='STRESS / BACKW'||R==='VOL SHOCK';
-  const contango=sl>=1.0,steep=sl>=1.08;
-  const st=DATA.backtest.breakdowns["Straddle (ATM)"].regime.find(x=>x.regime===R);   // measured, this regime
+  const sl=reg.slope,vix=reg.vix,vixp=reg.vix_pct,R=reg.label;
+  const calm=R==='CALM CARRY'||R==='STEADY CARRY';
   const F=[],A=[],C=[];
   const push=(a,name,desc,ev)=>a.push({name,desc,ev});
-  const mEv=st?`measured ${R}: ${st.mean>=0?'+':''}${num(st.mean,2)}%/tr · win ${num(st.hit,0)}% · p5 ${num(st.p5,1)}% · worst ${num(st.worst,1)}% (n=${st.n})`:'no measured sample';
-  const thin=st&&st.n<100?' · thin sample':'';
-  const calmTail=calm&&st?' · note: largest historical losses started in calm regimes':'';
+  const bd=n=>DATA.backtest.breakdowns[n].regime.find(x=>x.regime===R);
+  const evOf=(lbl,s)=>s?`measured ${lbl}, ${R}: ${s.mean>=0?'+':''}${num(s.mean,2)}%/tr · win ${num(s.hit,0)}% · p5 ${num(s.p5,1)}% · worst ${num(s.worst,1)}% (n=${s.n})`+(s.n<100?' · thin sample':''):'no measured sample';
 
-  // rv_composite drag: measured (2026-08-26) — in CALM/STEADY a positive rv10-rv63
-  // precedes weaker short-vol P&L. Only these two regimes (TRANSITION flips sign).
+  // rv_composite drag (spec §6): in CALM/STEADY a positive rv10−rv63 measurably precedes
+  // weaker short-vol P&L. Only these two regimes (TRANSITION flips sign).
   const rvcDrag=calm&&reg.rvc_accel;
-  const rvcEv=rvcDrag?` · ⚠ RV accelerating (rv comp +${num(reg.rvc,2)}) — measured drag on short vol`:'';
-  // Short vol, defined risk — thresholds: Favored mean≥0.3 & win≥65 · Caution mean<0 or win<60
-  if(st){
-    const ev=mEv+thin+calmTail+rvcEv;
-    if(rvcDrag&&st.mean>=0.3&&st.hit>=65)push(A,'Iron Condors / Short Strangle','short vol — paid here, but RV accelerating (size down)',ev);
-    else if(st.mean>=0.3&&st.hit>=65)push(F,'Iron Condors / Short Strangle','short vol — historically paid in this regime',ev);
-    else if(st.mean<0||st.hit<60)push(C,'Iron Condors / Short Strangle','short vol — historically weak in this regime',ev);
-    else push(A,'Iron Condors / Short Strangle','short vol — mixed record in this regime',ev);
-  }
-  // Short vol, undefined risk — stricter: also requires calm realized vol
-  if(st){
-    const ev=mEv+(rvCalm?' · RV accel low':' · RV accel elevated')+calmTail+rvcEv;
-    if(st.mean>=0.5&&st.hit>=65&&rvCalm&&!rvcDrag)push(F,'Premium Selling (ATM)','undefined-risk short vol — paid & RV calm',ev);
-    else if(st.mean<0||st.hit<60||!rvCalm||rvcDrag)push(C,'Premium Selling (ATM)','undefined risk — weak record or RV accelerating',ev);
-    else push(A,'Premium Selling (ATM)','size down — mixed record',ev);
-  }
+  const rvcEv=rvcDrag?` · ⚠ RV accelerating (rv10−rv63 +${num(reg.rvc,2)}) — measured drag on short vol`:'';
+  // Short vol, defined/limited risk — cut-offs: Favored mean≥0.3 & win≥65 · Caution mean<0 or win<60
+  [["Iron Condor (16/5Δ)","Iron Condor (16/5Δ)","defined risk"],["Short Strangle (16Δ)","Strangle (16Δ)","undefined risk, OTM"]].forEach(([name,key,kind])=>{
+    const s=bd(key); if(!s)return;
+    const ev=evOf(key,s)+rvcEv;
+    if(rvcDrag&&s.mean>=0.3&&s.hit>=65)push(A,name,`${kind} — paid here, but RV accelerating (size down)`,ev);
+    else if(s.mean>=0.3&&s.hit>=65)push(F,name,`${kind} — historically paid in this regime`,ev);
+    else if(s.mean<0||s.hit<60)push(C,name,`${kind} — historically weak in this regime`,ev);
+    else push(A,name,`${kind} — mixed record in this regime`,ev);
+  });
+  // ATM premium selling — stricter: Favored needs mean≥0.5 & win≥65 and no RV drag
+  {const s=bd("Straddle (ATM)");
+   if(s){const ev=evOf("ATM straddle",s)+rvcEv;
+    if(s.mean>=0.5&&s.hit>=65&&!rvcDrag)push(F,'Premium Selling (ATM)','undefined-risk short vol — historically paid in this regime',ev);
+    else if(s.mean<0||s.hit<60||rvcDrag)push(C,'Premium Selling (ATM)','undefined risk — weak record or RV accelerating',ev);
+    else push(A,'Premium Selling (ATM)','size down — mixed record',ev);}}
   // Term-structure carry — measured: 9/30 ATM call calendar backtest, per current regime
   {const sc=DATA.backtest.breakdowns["Calendar 9/30 (ATM call)"].regime.find(x=>x.regime===R);
    const ev=sc?`measured 9/30 calendar, ${R}: ${sc.mean>=0?'+':''}${num(sc.mean,2)}%/tr · win ${num(sc.hit,0)}% · p5 ${num(sc.p5,1)}% (n=${sc.n})`+(sc.n<100?' · thin sample':'')+` · slope ${sl}`:'no measured sample';
@@ -1495,7 +1624,7 @@ function renderBacktest(){
   const pick=n=>bt.structures[n][sk][ga];
 
   el("bt-title").textContent="▶ OPTION-STRUCTURE BACKTEST · 30 DTE · hold to expiry";
-  el("bt-sub").innerHTML=`Every day: open the structure priced from the interpolated 30d IV via Black-Scholes (−${P.slip}% modeled cost), hold to expiry — ${P.dte} calendar days ≈ ${P.exp_td} trading sessions. Equity = non-overlapping trades over ${P.years} years, ${P.unit}.`;
+  el("bt-sub").innerHTML=`Every day: open the structure priced from the interpolated 30d IV via Black-Scholes (−${P.slip}% modeled cost), hold to expiry — ${P.dte} calendar days ≈ ${P.exp_td} trading sessions. Equity curve = one entry phase (starting on the first day) of non-overlapping trades over ${P.years} years, ${P.unit}; the table's totals and drawdowns are the median over all ${P.exp_td} phases.`;
 
   // toggle buttons
   el("bt-skew").innerHTML=`<button class="lb${!state.skew?" active":""}" data-tg="skew" data-v="0">off (ATM)</button><button class="lb${state.skew?" active":""}" data-tg="skew" data-v="1">approx</button>`;
@@ -1511,10 +1640,10 @@ function renderBacktest(){
     ["Worst trade %",s=>num(s.stats.worst,1),"The single worst trade in the whole sample — the left tail made explicit."],
     ["5th-pctile trade %",s=>num(s.stats.p5,1),"5% of all trades were worse than this value."],
     ["Avg win / loss",s=>num(s.stats.avg_win,2)+" / "+num(s.stats.avg_loss,2),"Average size of winning vs losing trades — shows the asymmetry of the payoff."],
-    ["Trades",s=>s.n,"Non-overlapping trades used for the equity curve (one position at a time)."],
-    ["Total return %",s=>num(s.tot,1),"Sum of non-overlapping per-trade returns over the full period, % of spot notional."],
-    ["Annualised % (simple, tot/yrs)",s=>num(s.ann,1),"Total return ÷ years — simple average, not compounded."],
-    ["Max drawdown %",s=>num(s.mdd,1),"Deepest peak-to-trough decline of the non-overlapping equity curve."]];
+    ["Trades (one phase)",s=>s.n,"Non-overlapping trades in one entry phase (one position at a time)."],
+    ["Total return % · median [range]",s=>`${num(s.tot,1)} <span class="dim">[${num(s.tot_lo,0)} … ${num(s.tot_hi,0)}]</span>`,"Sum of non-overlapping per-trade returns, % of spot notional. A non-overlapping sequence depends on WHICH day it starts: the median over all entry phases is shown, with the min…max across phases."],
+    ["Annualised % (median, simple)",s=>num(s.ann,1),"Median total ÷ years — simple average, not compounded."],
+    ["Max drawdown % · median [range]",s=>`${num(s.mdd,1)} <span class="dim">[${num(s.mdd_lo,0)} … ${num(s.mdd_hi,0)}]</span>`,"Deepest peak-to-trough decline of the non-overlapping equity curve — median and range over all entry phases."]];
   el("bt-cmp").querySelector("thead").innerHTML="<tr><th>Metric</th>"+snames.map((n,i)=>`<th><span style="color:${cv(scols[i])}">${n}</span></th>`).join("")+"</tr>";
   el("bt-cmp").querySelector("tbody").innerHTML=metrics.map(([lab,fn,tp])=>
     `<tr><td data-tip="${tp}">${lab}</td>`+snames.map(n=>`<td>${fn(pick(n))}</td>`).join("")+"</tr>").join("");
@@ -1528,7 +1657,7 @@ function renderBacktest(){
   el("bt-reg-title").textContent=`▶ ${state.btStrat} · P&L BY ENTRY REGIME · flat, all daily entries, ${cadence}`;
   el("bt-q").querySelector("tbody").innerHTML=bd.quintile.map(b=>`<tr><td>Q${b.q}${b.q===1?" (cheap)":b.q===bd.quintile.length?" (rich)":""}</td><td>${num(b.sig,2)}</td><td>${num(b.pnl,2)}</td><td>${num(b.hit,0)}%</td></tr>`).join("");
   el("bt-reg").querySelector("tbody").innerHTML=bd.regime.map(b=>{const i=DATA.regime.order.indexOf(b.regime);return `<tr><td data-tip="${REGTIP[b.regime]||""}"><span style="color:${cv(DATA.regime.colors[i])}">■</span> ${b.regime}</td><td>${b.n}</td><td>${num(b.mean,2)}</td><td>${num(b.hit,0)}%</td><td>${num(b.p5,1)}</td><td>${num(b.worst,1)}</td></tr>`;}).join("");
-  el("bt-note").innerHTML=`Prices are <b>reconstructed</b> with Black-Scholes from the interpolated ATM 30d implied vol (no free option-quote history) — spot ^GSPC, rate ${P.rate}, dividend q=${P.q}. <b>Skew</b> (toggle) is a parametric approximation: IV(K)=IV_atm·(1+slope·(−m)), put slope ${P.skew_dn} / call slope ${P.skew_up} of standardized moneyness — a typical SPX smirk, <b>not</b> real per-strike quotes. Strikes for the 16Δ/5Δ legs are placed off the ATM vol. Also <b>no real bid-ask</b> (flat ${P.slip}% cost), settlement at expiry from the actual SPX path, P&L in % of spot notional (not margin — real leveraged returns and risk are higher). Good for <b>relative</b> comparison, not exact fills.`;
+  el("bt-note").innerHTML=`Prices are <b>reconstructed</b> with Black-Scholes, using the VIX (a 30-day variance-strip index) as the ATM-vol input (no free option-quote history). Under the usual skew the VIX sits above true ATM implied vol, so short-vol P&L here is biased upward — spot ^GSPC, rate ${P.rate}, dividend q=${P.q}. <b>Skew</b> (toggle) is a parametric approximation: IV(K)=IV_atm·(1+slope·(−m)), put slope ${P.skew_dn} / call slope ${P.skew_up} of standardized moneyness — a typical SPX smirk, <b>not</b> real per-strike quotes. Strikes for the 16Δ/5Δ legs are placed off the ATM vol. Also <b>no real bid-ask</b> (flat ${P.slip}% cost), settlement at expiry from the actual SPX path, P&L in % of spot notional (not margin — real leveraged returns and risk are higher). Good for <b>relative</b> comparison, not exact fills.`;
 }
 
 function render(){
@@ -1549,7 +1678,11 @@ function render(){
     `<span class="${s.ok?"chk":"chx"}" title="last ${s.last}, lag ${s.lag}">${s.ok?"✓":"✗"}</span> ${s.name}${s.ok?"":" (stale "+s.lag+"d)"}`).join(" ");
   const sr=el("s-regime");sr.textContent=reg.label;sr.style.color=cv(reg.color);
   sr.setAttribute("data-tip",REGTIP[reg.label]||"");
+  {const ru=DATA.regime.run,fresh=ru.days<=2;
+   el("s-run").innerHTML=`day ${ru.days} · since ${ru.since}`+(fresh?` · <span style="color:var(--amber)">UNCONFIRMED</span>`:"");
+   el("s-run").setAttribute("data-tip",`Labels have no hysteresis, so a new label is often a blip: ${ru.share_rev2}% of all ${ru.n_changes} label changes since ${DATA.first} reverted to the previous label within 2 sessions`+(ru.into_rev2!=null?` (${ru.into_rev2}% of the ${ru.into_n} switches into ${reg.label})`:"")+`. A label on day 1–2 is marked UNCONFIRMED. Previous regime: ${ru.prev||"—"}.`);}
   el("s-slope").textContent=`Term slope VIX3M/VIX ${reg.slope} (${reg.slope_txt}) · VIX ${reg.vix} (${ord(reg.vix_pct)} pct) · SPX ${reg.spx_state} · 20d ${reg.ret20>=0?"+":""}${reg.ret20}%`;
+  el("w-sess").setAttribute("data-tip",`Cards rank today's nowcast within this window; their forward-outcome stats (hit, worst, safety, path) can only use windows that have fully played out — for 30 DTE they end ${L.cards[L.cards.length-1].res_end}.`);
 
   /* OVERVIEW */
   const ranked=[...L.cards].sort((a,b)=>b.composite-a.composite);
@@ -1558,10 +1691,17 @@ function render(){
   const top=L.top;
   const c30=L.cards.find(c=>c.dte===30)||L.cards[L.cards.length-1];
   const tc=tradeContext(c30,reg);
-  el("ctx-sub").textContent=`This is not a trade instruction. ALL rows are assigned from MEASURED per-regime backtest stats: short vol via the straddle proxy (Favored mean≥0.3%/tr & win≥65, Caution mean<0 or win<60), calendars via the 9/30 ATM call calendar, long vol via buying the ATM straddle (negative mean = insurance cost).`;
+  el("ctx-sub").textContent=`This is not a trade instruction. Each row uses its own structure's measured per-regime backtest stats with hand-set cut-offs: short vol Favored mean≥0.3%/tr & win≥65 (ATM: mean≥0.5 and no RV drag), Caution mean<0 or win<60; calendars Favored ≥0.1/55, Caution <−0.05 or win<45; long vol = buying the ATM straddle (negative mean = insurance cost).`;
   el("ctx-meta").innerHTML=`Current regime: <b>${reg.label}</b><br>Top DTE by lookback: <b>${top.dte} DTE</b><br>Regime sample: ${reg.reg_days} days · hit ${num(reg.reg_hit,0)}%`;
   el("col-fav").innerHTML=colHTML(tc.F); el("col-acc").innerHTML=colHTML(tc.A); el("col-cau").innerHTML=colHTML(tc.C);
-  el("ctx-hist").innerHTML=`<b>${top.dte} DTE CURRENTLY RANKS HIGHEST.</b> Composite ${num(top.composite,1)}/100. Current VRP at the ${ord(top.vrp_pct)} percentile of trailing ${N}-session history. Hit rate ${num(top.hit,0)}%. Worst episode <span class="neg">${num(top.worst,1)}%</span>. Note: 7 DTE uses short-end interpolation (flat below the 9-day node) — treat it as indicative.`;
+  el("ctx-hist").innerHTML=`<b>${top.dte} DTE CURRENTLY RANKS #1 ON THE COMPOSITE.</b> Composite ${num(top.composite,1)}/100. Current VRP at the ${ord(top.vrp_pct)} percentile of trailing ${N}-session history. IV beat realized in ${num(top.hit,0)}% of the window. Worst forward VRP <span class="neg">${num(top.worst,1)} pts</span>. The composite ranks premium quality/safety, not expected P&amp;L. Note: 7 DTE uses short-end interpolation (flat below the 9-day node) — treat it as indicative.`;
+
+  /* EXPECTED MOVE (full history, fixed) */
+  {const E=DATA.expected,f0=x=>x==null?"—":Math.round(x).toLocaleString("en-US");
+   el("em-title").textContent=`▶ EXPECTED MOVE · IV-implied ±1σ to expiry from SPX ${E.spot.toLocaleString("en-US")} · measured coverage since 2011 (full history — does not follow the lookback)`;
+   el("em-tbl").querySelector("tbody").innerHTML=E.rows.map(r=>`<tr><td>${r.dte} <span class="dim">(${r.sess} sess.)</span></td><td>${num(r.iv,1)}%</td><td>±${f0(r.move)}</td><td>${f0(r.lo)} – ${f0(r.hi)}</td><td>${f0(r.p16)} · ${f0(r.c16)}</td><td><b>${num(r.cover,1)}%</b> <span class="dim">vs 68.3</span></td><td>${num(r.cover_h1,1)} · ${num(r.cover_h2,1)}</td><td>${num(r.put16,1)}% · ${num(r.call16,1)}%</td><td class="bad">${num(r.beyond2,1)}% · ${num(r.worst_z,1)}σ</td></tr>`).join("");
+   const b2=E.rows.map(r=>r.beyond2),wz=E.rows.map(r=>r.worst_z);
+   el("em-note").innerHTML=`SPX finished inside the implied ±1σ range far more often than the nominal 68% — at every tenor and in both halves of the sample. That excess <b>is</b> the volatility premium, not a safety margin: the misses are lopsided — below −2σ on ${num(Math.min(...b2),1)}–${num(Math.max(...b2),1)}% of entries, worst outcomes ${num(Math.max(...wz),1)}σ to ${num(Math.min(...wz),1)}σ, far beyond what a normal distribution allows — and that is where short-vol losses come from. Strikes are an ATM-vol approximation without skew (listed 16Δ puts sit further out). Moves use the interpolated IV per DTE; a 7-DTE range is indicative (flat below the 9-day node).`;}
 
   /* VRP MATRIX */
   const mx=DATA.matrix;let mh="<tr><th class='k'>DTE \\ Month</th>"+mx.months.map(m=>`<th>${m}</th>`).join("")+"</tr>";
@@ -1582,11 +1722,12 @@ function render(){
 
   /* REGIME ANALYSIS */
   const rvcTxt=(reg.rvc>=0?"+":"")+reg.rvc+(reg.rvc_accel?" ⚠ accel":" (calm)");
-  el("reg-grid").innerHTML=[["REGIME",reg.label],["VIX3M/VIX SLOPE",reg.slope+" ("+reg.slope_txt+")"],["VIX",reg.vix+"  ("+ord(reg.vix_pct)+" pct)"],["RV COMPOSITE (rv10−rv63)",rvcTxt],["SPX STATE",reg.spx_state],["20-DAY RETURN",(reg.ret20>=0?"+":"")+reg.ret20+"%"]].map(([k,v])=>`<div class="reg-cell" data-tip="${k.indexOf('RV COMPOSITE')===0?'rv10 − rv63 in vol points: >0 = realized vol accelerating vs its quarter norm. In CALM/STEADY this measurably drags short-vol P&L (Ticket 02).':''}"><div class="rk">${k}</div><div class="rv">${v}</div></div>`).join("");
-  const per=DATA.regime.per_regime, perW=(DATA.regime.per_regime_lb||{})[state.lb]||{};
+  el("reg-grid").innerHTML=[["REGIME",reg.label+` · day ${DATA.regime.run.days}`],["VIX3M/VIX SLOPE",reg.slope+" ("+reg.slope_txt+")"],["VIX",reg.vix+"  ("+ord(reg.vix_pct)+" pct)"],["RV SPREAD (rv10−rv63)",rvcTxt],["SPX STATE",reg.spx_state],["20-DAY RETURN",(reg.ret20>=0?"+":"")+reg.ret20+"%"]].map(([k,v])=>`<div class="reg-cell" data-tip="${k.indexOf('RV SPREAD')===0?'rv10 − rv63 in vol points: >0 = realized vol accelerating vs its quarter norm. In CALM/STEADY a positive value measurably preceded weaker short-vol P&L; no rule in TRANSITION (sign flips there).':''}"><div class="rk">${k}</div><div class="rv">${v}</div></div>`).join("");
+  el("term-snap").innerHTML=DATA.term.length>1?svgTermSnap():'<div class="dim">term structure unavailable</div>';
+  const per=DATA.regime.per_regime, perWraw=(DATA.regime.per_regime_lb||{})[state.lb]||{}, perNA=!!perWraw.na, perW=perNA?{}:perWraw;
   el("reg-tbl-title").textContent=`▶ PER-REGIME EVIDENCE · forward VRP-30 · full history vs selected window (${N} sessions)`;
   el("reg-tbl").querySelector("tbody").innerHTML=DATA.regime.order.map((l,i)=>{const p=per[l],w=perW[l]||{};
-    const wcell=w.ok?`${num(w.avg_vrp,2)}`:`<span class="dim" title="only ${w.n||0} obs, below the ${DATA.regime.min_reg_n}-obs minimum">insufficient (n=${w.n||0})</span>`;
+    const wcell=perNA?`<span class="dim" title="a ${N}-session window holds at most ${perWraw.max_n} resolved 30-DTE outcomes">n/a at this lookback</span>`:w.ok?`${num(w.avg_vrp,2)}`:`<span class="dim" title="only ${w.n||0} obs, below the ${DATA.regime.min_reg_n}-obs minimum">insufficient (n=${w.n||0})</span>`;
     const whit=w.ok?`${num(w.hit,0)}%`:`—`;
     return `<tr><td data-tip="${REGTIP[l]||""}"><span style="color:${cv(DATA.regime.colors[i])}">■</span> ${l}</td><td>${p.days} (${num(p.share,1)}%)</td><td>${num(p.avg_vrp,2)}</td><td>${num(p.hit,0)}%</td><td>${wcell}</td><td>${whit}</td></tr>`;}).join("");
   el("reg-tbl-note").innerHTML=`"Avg VRP" = mean of IV − subsequent realized vol on days in that regime. <b>Full</b> = whole history (stable reference). <b>Window</b> = the selected lookback, gated at a hard ${DATA.regime.min_reg_n}-observation minimum — below it a cell reads <i>insufficient</i> rather than a misleading number (forward RV overlaps ~21×, so small windows have very few independent observations). Descriptive of history, not a forecast.`;
@@ -1594,20 +1735,22 @@ function render(){
   /* VALIDATION */
   const v=DATA.validation;
   el("val-tbl").querySelector("tbody").innerHTML=v.buckets.map(b=>`<tr><td>Q${b.bucket}${b.bucket===1?" (cheapest)":b.bucket===v.buckets.length?" (richest)":""}</td><td>${b.n}</td><td>${num(b.sig,2)}</td><td>${num(b.out,2)}</td><td>${num(b.hit,0)}%</td></tr>`).join("");
-  const mono=v.buckets[v.buckets.length-1].out>v.buckets[0].out;
-  el("val-note").innerHTML=`Signal ranges from Q1 (IV cheapest vs realized) to Q5 (richest). ${mono?"Forward VRP rises across quintiles → the signal carries forward information.":"Pattern is not monotone → limited forward edge."}`;
+  const qs=v.buckets.map(b=>`Q${b.bucket} ${num(b.out,2)}`).join(" · ");
+  el("val-note").innerHTML=`Signal ranges from Q1 (IV cheapest vs realized) to Q5 (richest). `+(v.mono?`Forward VRP rises across all five quintiles → the signal carries graded forward information.`:`<b>Not monotone</b> (${qs}; highest in Q${v.best_q}) → little graded forward information.`)+
+    ` Rank correlation signal→outcome on the ${v.ic_k} non-overlapping phases: median ${num(v.ic_med,3)} (range ${num(v.ic_lo,3)} … ${num(v.ic_hi,3)}, positive in ${v.ic_pos}/${v.ic_k}). Quintile edges are set on the full history (in-sample).`;
   let eq=0,eqser=[],mdd=0,peak=0;slice(ch.vrp30_fwd,N).forEach(x=>{if(x!=null){eq+=x;}eqser.push(x==null?null:eq);peak=Math.max(peak,eq);mdd=Math.min(mdd,eq-peak);});
   el("eq-title").textContent=`▶ CUMULATIVE CAPTURED VRP-30 (equity proxy) · last ${N} sessions`;
   el("chart-eq").innerHTML=lineChart([{name:"cum VRP",color:"--green",data:eqser}],{dates:dts,zero:true,area:true});
-  el("val-sum").innerHTML=[["Mean forward VRP",num(v.mean,2)],["Std",num(v.std,2)],["Info ratio (mean/std)",num(v.info_ratio,2)],["Hit rate",num(v.hit,0)+"%"],["Best / Worst",num(v.best,1)+" / "+num(v.worst,1)],["Sample size",v.n+" days"],["Window max drawdown",num(mdd,1)]].map(([k,x])=>`<div class="row"><span class="rk">${k}</span><span class="rv">${x}</span></div>`).join("");
+  el("eq-mdd").textContent=`Window max drawdown of this proxy: ${num(mdd,1)} vol pts (summed over overlapping windows).`;
+  el("val-sum").innerHTML=[["Mean forward VRP",num(v.mean,2)],["Std",num(v.std,2)],["Info ratio (mean/std)",num(v.info_ratio,2)],["Hit rate",num(v.hit,0)+"%"],["Best / Worst",num(v.best,1)+" / "+num(v.worst,1)],["Sample size",`${v.n} days (≈${v.n_eff} independent 21-session windows)`],["Nowcast VRP < 0 → forward VRP",v.neg_n?`${num(v.neg_out,2)} pts, positive ${num(v.neg_pos,0)}% (n=${v.neg_n} days)`:"—"]].map(([k,x])=>`<div class="row"><span class="rk">${k}</span><span class="rv">${x}</span></div>`).join("");
 
   /* ANALOG ENGINE */
   const an=DATA.analog;
   el("an-title").textContent=`▶ ANALOG ENGINE · ${an.k} nearest historical days · full history (fixed — does not follow the lookback buttons)`;
   el("an-sub").textContent=`Window ${an.window_from} – ${an.window_to} · ${an.n_eligible.toLocaleString("en-US")} eligible days. Measured skill: fwd-RV Spearman ≈0.60 vs 0.55 baseline; return prediction ≈0 → context, not alpha.`;
-  el("an-state").innerHTML=[["VIX",an.cur.vix],["VIX9D/VIX",an.cur.v9v],["VIX/VIX3M",an.cur.vv3m],["RV COMPOSITE",an.cur.rvc],["21d EFFICIENCY",an.cur.er21]].map(([k,x])=>`<div class="reg-cell"><div class="rk">${k}</div><div class="rv">${x}</div></div>`).join("");
-  el("an-h").querySelector("tbody").innerHTML=an.per_h.map(h=>`<tr><td>${h.h}d</td><td>${h.matches}</td><td class="${h.avg>=0?'good':'bad'}">${num(h.avg,2)}%</td><td>${num(h.med,2)}%</td><td class="bad">${num(h.worst,1)}%</td><td class="good">${num(h.best,1)}%</td><td>${num(h.pos,0)}%</td></tr>`).join("");
-  el("an-h-note").innerHTML=`Across the ${an.k} nearest analogs: average forward realized vol ${an.avg_fwd_rv}%, average 21-day VIX change ${an.avg_vix_chg>=0?"+":""}${an.avg_vix_chg}. Forward outcomes are historical analogs, <b>not forecasts</b>.`;
+  el("an-state").innerHTML=[["VIX",an.cur.vix],["VIX9D/VIX",an.cur.v9v],["VIX/VIX3M",an.cur.vv3m],["RV SPREAD (rv10−rv63)",an.cur.rvc],["21d EFFICIENCY",an.cur.er21]].map(([k,x])=>`<div class="reg-cell"><div class="rk">${k}</div><div class="rv">${x}</div></div>`).join("");
+  el("an-h").querySelector("tbody").innerHTML=an.per_h.map(h=>`<tr><td>${h.h} DTE (${h.sess} sess.)</td><td>${h.matches}</td><td class="${h.avg>=0?'good':'bad'}">${num(h.avg,2)}%</td><td>${num(h.med,2)}%</td><td class="bad">${num(h.worst,1)}%</td><td class="good">${num(h.best,1)}%</td><td>${num(h.pos,0)}%</td></tr>`).join("");
+  el("an-h-note").innerHTML=`Across the ${an.k} nearest analogs: average forward realized vol ${an.avg_fwd_rv}% and average VIX change ${an.avg_vix_chg>=0?"+":""}${an.avg_vix_chg} over the next 21 sessions (30 DTE). Forward outcomes are historical analogs, <b>not forecasts</b>.`;
   el("an-top").querySelector("tbody").innerHTML=an.top.map(t=>`<tr><td>${t.date}</td><td><span style="color:${cv(REG_COLOR_JS(t.regime))}">${t.regime}</span></td><td>${t.dist}</td><td>${t.sim}%</td><td>${t.vix}</td><td class="${t.ret21>=0?'good':'bad'}">${num(t.ret21,1)}%</td><td>${num(t.fwd_rv,1)}%</td></tr>`).join("");
 
   /* BACKTEST */
@@ -1619,6 +1762,9 @@ function render(){
   let rxl="";for(let k=0;k<8;k++){const i=Math.round(k*(codes.length-1)/7);rxl+=`<text x="${(i*cw).toFixed(1)}" y="${rh-3}" fill="#4d5a6d" font-size="9">${dts[i].slice(0,7)}</text>`;}
   el("tl-title").textContent=`▶ REGIME TIMELINE · last ${N} sessions`;
   el("ribbon").innerHTML=`<svg viewBox="0 0 ${rw} ${rh}" class="chart" preserveAspectRatio="none" font-family="var(--mono)">${rib}${rxl}</svg>`;
+  {const ru=DATA.regime.run,rc=l=>`<span style="color:${cv(REG_COLOR_JS(l))}">${l}</span>`;
+   el("tl-log").querySelector("tbody").innerHTML=ru.log.map(x=>`<tr><td>${x.date}</td><td>${rc(x.frm)}</td><td>${rc(x.to)}</td><td>${x.run}${x.ongoing?" (ongoing)":x.run<=2?' <span class="dim">· blip</span>':""}</td></tr>`).join("");
+   el("tl-log-note").innerHTML=`${ru.n_changes} label changes since ${DATA.first}; ${ru.share_rev2}% reverted to the previous label within 2 sessions. The rules have no hysteresis on purpose — every backtest and per-regime statistic is bound to these exact labels — so read a day-1/day-2 label as unconfirmed.`;}
   el("tl-leg").innerHTML=DATA.regime.order.map((l,i)=>`<span class="lg" data-tip="${REGTIP[l]||""}"><span class="sw" style="background:${cv(DATA.regime.colors[i])}"></span>${l}</span>`).join("");
 
   /* FORECAST */
@@ -1631,30 +1777,37 @@ function render(){
   const F=DATA.forecast;
   el("fc-head").textContent=`▶ REGIME FORECAST · next ${F.horizon} trading days`;
   el("fc-sub").textContent=`From today's regime (${reg.label}). Evidence-based next-regime probabilities — does not forecast SPX direction, VIX level, returns or trade profitability.`;
-  const conf=F.top_prob, risk=conf>=60?"LOW":conf>=45?"MODERATE":"HIGH";
+  const FM=F.family;
   el("fc-cards").innerHTML=[
     ["MOST LIKELY NEXT",`<span style="color:${cv(REG_COLOR_JS(F.top))}">${F.top}</span> · ${F.top_prob}%`],
     ["SECOND",`${F.second} · ${F.second_prob}%`],
-    ["TRANSITION RISK",`${risk} (top ${F.top_prob}% vs 2nd ${F.second_prob}%)`]
+    ["P(REGIME CHANGES)",`${num(100-(F.dist[F.order.indexOf(reg.label)]||0),1)}% within ${F.horizon} sessions`],
+    ["FAMILY",FM.names.map((nm,i)=>`${i===FM.names.indexOf(FM.top)?"<b>":""}${nm} ${num(FM.dist[i],0)}%${i===FM.names.indexOf(FM.top)?"</b>":""}`).join(" · ")]
   ].map(([k,v])=>`<div class="reg-cell"><div class="rk">${k}</div><div class="rv">${v}</div></div>`).join("");
   el("fc-title").textContent=`▶ NEXT-REGIME PROBABILITY · ${F.horizon} trading days out`;
   el("fc-bars").innerHTML=F.order.map((l,i)=>{const p=F.dist[i]||0;return `<div class="fcbar"><span class="fk" data-tip="${REGTIP[l]||""}"><span style="color:${cv(F.colors[i])}">■</span> ${l}</span><span class="track"><span class="fill" style="width:${p}%;background:${cv(F.colors[i])}"></span></span><span class="fv">${num(p,1)}%</span></div>`;}).join("");
   const cal=F.calib;
   el("fc-cal-title").textContent=`▶ FORECAST RELIABILITY · retroactive causal backtest · ${cal.n.toLocaleString("en-US")} daily forecasts since ${F.cal_from}`;
-  el("fc-cal").querySelector("tbody").innerHTML=cal.buckets.map(b=>`<tr><td>${b.bucket}</td><td>${b.n}</td><td>${b.conf==null?"—":b.conf+"%"}</td><td>${b.acc==null?"—":b.acc+"%"}</td><td class="${b.err==null?"":(b.err<0?"bad":"good")}">${b.err==null?"—":(b.err>0?"+":"")+b.err+" pp"}</td></tr>`).join("");
-  el("fc-cal-note").innerHTML=`Each day's forecast is re-derived from data up to that day, then marked HIT/MISS after ${F.horizon} trading days. This is a <b>simulated causal replay, not a live journal</b> — identical for everyone, regenerated each build. Overall: avg confidence ${cal.overall_conf}%, actual ${cal.overall_acc}% → <b class="${cal.bias_pp<0?'bad':'good'}">${cal.bias} (${cal.bias_pp>0?"+":""}${cal.bias_pp} pp)</b>. Quality ${cal.quality}/100. Bucket errors are shown, not hidden — that is what the curve is for.`;
+  const calRow=(b,pre)=>`<tr><td>${pre}${b.bucket}</td><td>${b.n}</td><td>${b.conf==null?"—":b.conf+"%"}</td><td>${b.acc==null?"—":b.acc+"%"}</td><td class="${b.err==null?"":(Math.abs(b.err)<=2?"":(b.err<0?"bad":"good"))}">${b.err==null?"—":(b.err>0?"+":"")+b.err+" pp"}</td></tr>`;
+  el("fc-cal").querySelector("tbody").innerHTML=cal.buckets.map(b=>calRow(b,"")).join("")+
+    `<tr><td colspan="5" class="dim" style="padding-top:10px">FAMILY (carry · neutral · stress — summed probabilities): accuracy ${FM.acc}% at avg confidence ${FM.conf}%, ECE ${num(FM.ece,1)} pp</td></tr>`+
+    FM.buckets.map(b=>calRow(b,"family ")).join("");
+  el("fc-cal-note").innerHTML=`Each day's forecast is re-derived from data up to that day, then marked HIT/MISS after ${F.horizon} trading days. This is a <b>simulated causal replay, not a live journal</b> — identical for everyone, regenerated each build. Overall: avg confidence ${cal.overall_conf}%, actual ${cal.overall_acc}% → <b class="${cal.bias==="within noise"?"":(cal.bias_pp<0?'bad':'good')}">${cal.bias} (${cal.bias_pp>0?"+":""}${cal.bias_pp} pp; noise ±${num(2*cal.se_pp,1)} pp)</b>. Calibration error (ECE, bucket-weighted) ${num(cal.ece,1)} pp. Yardstick: naive "regime stays" was right ${cal.base_acc}% of the time — the six-way top pick is nearly always "stays", so its edge is in the probabilities, not the pick. The family readout is far more accurate because it ignores the frequent CALM↔STEADY flips.`;
   el("fc-jrn").querySelector("tbody").innerHTML=F.journal.map(j=>`<tr><td>${j.date}</td><td><span style="color:${cv(REG_COLOR_JS(j.regime))}">${j.regime}</span></td><td>${j.pred}</td><td>${j.prob}%</td><td>${j.actual||"—"}</td><td class="${j.status==='HIT'?'good':j.status==='MISS'?'bad':''}">${j.status}</td></tr>`).join("");
 
   /* FORWARD TEST — genuine out-of-sample, grows forward only */
   const FW=DATA.forward;
   el("fw-title").textContent=`▶ FORWARD TEST · live, out-of-sample · started ${FW.since}`;
   el("fw-sub").innerHTML=`The honest test: each build logs that day's forecast and marks it HIT/MISS ${FW.horizon} trading days later. Unlike the retroactive curve above, the logged forecast is never changed afterwards — only the outcome is re-read from the current data each build. ${FW.n_resolved===0?"<b>No forecasts have resolved yet — building up.</b>":""}`+
+    (FW.all_stay&&FW.n_resolved?` So far every logged top forecast was "regime stays", so the hit rate equals the no-change baseline by construction; "model expected" is the sum of the logged probabilities — what the model itself promised. Five-day targets overlap, so ${FW.n_resolved} resolved rows are only ≈${FW.n_indep} independent outcomes.`:"")+
     (FW.n_lagged?`<br><span class="dim">† The first ${FW.n_lagged} entries (to ${FW.lagged_until}) were logged from partly stale inputs: the build ran before Cboe had published that day's VIX close, so the stated regime is usually the previous session's. They stay in the log and in the total; the clean count below excludes them.</span>`:"");
   el("fw-cards").innerHTML=[
-    ["RESOLVED",`${FW.n_resolved}`],
+    ["RESOLVED · PENDING",`${FW.n_resolved} · ${FW.n_pending} <span class="dim" style="font-size:11px">(≈${FW.n_indep} independent)</span>`],
     ["HIT RATE · ALL",FW.hit_rate==null?"— (building up)":`${FW.hit_rate}% (${FW.hits}/${FW.n_resolved})`],
+    ["MODEL EXPECTED",FW.n_resolved?`${num(FW.expected,1)} hits`:"—"],
+    ["NO-CHANGE BASELINE",FW.n_resolved?`${FW.base_hits}/${FW.n_resolved}`:"—"],
+    ["FAMILY HIT",FW.n_resolved?`${FW.fam_hits}/${FW.n_resolved}`:"—"],
     ["HIT RATE · CLEAN INPUTS",FW.clean_rate==null?`— (${FW.n_clean} resolved yet)`:`${FW.clean_rate}% (${FW.clean_hits}/${FW.n_clean})`],
-    ["PENDING",`${FW.n_pending}`],
   ].map(([k,v])=>`<div class="reg-cell"><div class="rk">${k}</div><div class="rv">${v}</div></div>`).join("");
   el("fw-tbl").querySelector("tbody").innerHTML=FW.recent.length?FW.recent.map(j=>`<tr><td>${j.date}${j.inputs==="lagged"?' <span class="dim" title="logged from partly stale inputs">†</span>':""}</td><td><span style="color:${cv(REG_COLOR_JS(j.regime))}">${j.regime}</span></td><td>${j.pred}</td><td>${j.prob}%</td><td>${j.resolved_on||"—"}</td><td>${j.actual||"—"}</td><td class="${j.status==='HIT'?'good':j.status==='MISS'?'bad':''}">${j.status}</td></tr>`).join(""):`<tr><td colspan="7" class="dim">No entries yet — the first build logs today's forecast.</td></tr>`;
 
@@ -1664,7 +1817,7 @@ function render(){
     (DATA.held_back?`<div class="row"><span class="rk">AS-OF HELD</span><span class="rv">${DATA.asof} — waiting for ${DATA.waiting.join(", ")} (${DATA.held_back} newer session${DATA.held_back>1?"s":""} not used yet; nothing forward-filled)</span></div>`:"");
   el("set-par").innerHTML=[["History start",DATA.first],["As of",DATA.asof],["Total sessions",DATA.n_total],["DTE horizons",DATA.dtes.join(" / ")],["Lookbacks",Object.values(DATA.lookbacks).map(l=>l.name).join(" · ")],["Term nodes (days)",Object.entries(DATA.node_days).map(([k,v])=>k+"="+v).join(" · ")],["Forecast horizon",DATA.forecast.horizon+" trading days (streak-adjusted persistence)"]].map(([k,x])=>`<div class="row"><span class="rk">${k}</span><span class="rv">${x}</span></div>`).join("");
   el("set-w").innerHTML=Object.entries(DATA.weights).map(([k,x])=>`<div class="row"><span class="rk">${k.toUpperCase()}</span><span class="rv">${x}%</span></div>`).join("");
-  el("set-subs").innerHTML=`<b style="color:var(--ink-dim)">RICH</b> — richness: percentile of current VRP within this DTE's own trailing history (rich IV vs its norm).<br><b style="color:var(--ink-dim)">CARRY</b> — carry per day: VRP ÷ calendar days, ranked across the DTE set (which tenor pays most premium per day now, relative).<br><b style="color:var(--ink-dim)">SAFETY</b> — merged reliability (info ratio = mean ÷ std of forward VRP) + tail-safety (1 − |CVaR₅|). These two were measured to be redundant (Spearman +0.89 on the real definitions, 2026-08-26), so they are one axis to avoid double-counting.<br><b style="color:var(--ink-dim)">PATH</b> — path-safety: trailing mean Max Adverse Excursion of the SPX price path over the forward window, inverted percentile within its own window history. A genuine <i>path</i> axis (the price journey), distinct from SAFETY's VRP-outcome tail.<br><b style="color:var(--ink-dim)">STAB</b> — stability: steadiness of recent VRP vs its window dispersion.<br>Five decorrelated axes — level, cross-sectional carry, outcome safety, path safety, steadiness — so the composite doesn't double-count. <b>Note:</b> the composite ranks premium <i>quality/safety</i>, not expected P&L — measured (2026-08-26) low-vol conditions precede weaker short-vol returns (complacency).`;
+  el("set-subs").innerHTML=`<b style="color:var(--ink-dim)">RICH</b> — richness: percentile of today's nowcast VRP among this DTE's nowcasts in the window (rich IV vs its norm).<br><b style="color:var(--ink-dim)">CARRY</b> — carry per day: VRP ÷ calendar days, ranked across the DTE set (which tenor pays most premium per day now, relative). By construction it tends to favour short tenors.<br><b style="color:var(--ink-dim)">SAFETY</b> — merged reliability (info ratio = mean ÷ std of forward VRP) + tail-safety (1 − max(−CVaR₅,0)/50). These two were measured to be redundant (Spearman +0.89 on the real definitions, 2026-08-26), so they are one axis to avoid double-counting.<br><b style="color:var(--ink-dim)">PATH</b> — path-safety: trailing mean Max Adverse Excursion of the SPX price path over the forward window, inverted percentile within its own window history. A genuine <i>path</i> axis (the price journey), distinct from SAFETY's VRP-outcome tail.<br><b style="color:var(--ink-dim)">STAB</b> — stability: steadiness of the last 21 nowcasts vs the window's nowcast dispersion.<br>Five axes — level, cross-sectional carry, outcome safety, path safety, steadiness — mostly weakly correlated; at 7 DTE RICH and CARRY co-move, so short-tenor richness is partly counted twice. <b>Note:</b> the composite ranks premium <i>quality/safety</i>, not expected P&L — measured (2026-08-26) low-vol conditions precede weaker short-vol returns (complacency).`;
   el("set-rules").innerHTML=`VIX≥40 → <code>VOL SHOCK</code> · VIX≥28 or slope&lt;0.97 → <code>STRESS / BACKW</code> · VIX≥20 → <code>TRANSITION</code> · slope≥1.05 &amp; uptrend &amp; VIX&lt;17 → <code>CALM CARRY</code> · slope≥1.0 &amp; uptrend → <code>STEADY CARRY</code> · else → <code>NEUTRAL RANGE</code>.<br>slope = VIX3M / VIX (&gt;1 contango). uptrend = SPX &gt; 200-day moving average.`;
 
   /* HELP — live numbers injected from the dataset */
@@ -1685,7 +1838,7 @@ function render(){
    el("h-size").textContent=wsd?Math.round(2/Math.abs(wsd)*100):"—";}
 
   const wt=DATA.weights;
-  el("foot").innerHTML=`<b>Composite over 5 independent axes:</b> RICHNESS ${wt.rich}% · CARRY/day ${wt.carry}% · SAFETY ${wt.safety}% · PATH ${wt.path}% · STABILITY ${wt.stab}%. &nbsp;·&nbsp; <b>VRP</b> = interpolated implied vol − horizon-matched realized vol, vol points. Percentile/safety/path/validation use forward RV or the forward price path; the nowcast uses trailing RV. Free public data only (yfinance). Research tool — evidence, not advice. Not investment advice.`;
+  el("foot").innerHTML=`<b>Composite over five axes:</b> RICHNESS ${wt.rich}% · CARRY/day ${wt.carry}% · SAFETY ${wt.safety}% · PATH ${wt.path}% · STABILITY ${wt.stab}%. &nbsp;·&nbsp; <b>VRP</b> = interpolated implied vol − horizon-matched realized vol, vol points. Percentile/safety/path/validation use forward RV or the forward price path; the nowcast uses trailing RV. Free public data only (Yahoo ^GSPC, Cboe VIX family). Research tool — evidence, not advice. Not investment advice.`;
 }
 
 el("tabs").addEventListener("click",e=>{const b=e.target.closest(".tab");if(!b)return;state.tab=b.dataset.tab;
@@ -1721,15 +1874,12 @@ render();
    page flags itself as stale without a new deploy. Trading-day aware: weekends don't count. */
 (function(){
   try{
-    const asof=new Date(DATA.asof_iso+"T00:00:00");
-    const now=new Date();
-    let bdays=0; const d=new Date(asof);
-    while(d<now){d.setDate(d.getDate()+1);const wd=d.getDay();if(wd!==0&&wd!==6)bdays++;}
-    const THRESH=3;                       // >3 business days stale = source likely disrupted
-    if(bdays>THRESH){
-      el("stale-msg").innerHTML=`⚠ <b>DATA MAY BE STALE</b> — last successful update <b>${DATA.asof}</b> `+
-        `(${bdays} business days ago). The free data source (Yahoo/Cboe) is likely disrupted; `+
-        `every figure reflects that date, not today. The build refreshes automatically once the source recovers.`;
+    // the build decides the deadline (next expected run + one holiday + one failed run);
+    // the page only compares it with the clock — no time-zone or weekday arithmetic here.
+    if(Date.now()>Date.parse(DATA.stale_after_utc)){
+      el("stale-msg").innerHTML=`⚠ <b>DATA MAY BE STALE</b> — data as of <b>${DATA.asof}</b>; `+
+        `the next update was expected ${DATA.expected_utc}. The free data source (Yahoo/Cboe) or the build is likely disrupted; `+
+        `every figure reflects that date, not today. The page refreshes automatically once the source recovers.`;
       el("stale-overlay").style.display="block";
       document.body.style.paddingTop=el("stale-overlay").offsetHeight+"px";
     }
