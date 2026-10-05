@@ -2,7 +2,10 @@ name: build-and-deploy
 
 on:
   schedule:
-    - cron: "30 23 * * 1-5"   # weekdays 23:30 UTC — after US close & index settlement
+    # Mon–Sat 11:00 UTC = previous US session. Cboe publishes VIX9D/3M/6M ~22:30 UTC but
+    # the VIX close only the next morning (~08:30 UTC; every 23:30 run 2026-09-17..10-02
+    # read the previous day's VIX). 11:00 UTC is before the US open in both DST states.
+    - cron: "0 11 * * 1-6"
   workflow_dispatch:           # manual runs from the Actions tab
   push:
     branches: [main]           # every push redeploys with fresh data

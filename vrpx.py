@@ -137,20 +137,44 @@ def load():
         cols[yf_sym] = s
         origin[yf_sym] = where
     px = pd.DataFrame(cols)
+    # Cboe lists ^VIX on US market holidays where nothing else has a close — not sessions.
+    px = px[px.drop(columns="^VIX").notna().any(axis=1)]
+
+    # AS-OF = the last session on which every live series has its OWN close. Cboe posts
+    # the VIX close only the next morning (~08:30 UTC); a build in between used to
+    # forward-fill it and stamped yesterday's VIX with today's date (found 2026-10-05).
+    # The trailing edge is never filled — the whole report is held back instead.
+    STALE_MAX = 3
+    REQUIRED = ["SPX", "^VIX", "^VIX9D"]
+    OPTIONAL = ["^VIX3M", "^VIX6M"]           # waited for while live, dropped once dead
+    last = {c: px[c].last_valid_index() for c in REQUIRED + OPTIONAL}
+    dead = [c for c in REQUIRED if last[c] is None]
+    if dead:
+        raise RuntimeError("no data for " + ", ".join(dead))
+    newest = max(d for d in last.values() if d is not None)
+    lag_of = {c: (int((px.index > last[c]).sum()) if last[c] is not None else 9999) for c in last}
+    live = REQUIRED + [c for c in OPTIONAL if lag_of[c] <= STALE_MAX]
+    asof = min(last[c] for c in live)
+
     # real per-source freshness, measured BEFORE ffill (ffill would mask staleness)
     src = []
     for name, col in [("SPX", "SPX"), ("VIX", "^VIX"), ("VIX9D", "^VIX9D"),
                       ("VIX3M", "^VIX3M"), ("VIX6M", "^VIX6M")]:
-        s = px[col].dropna() if col in px else pd.Series(dtype=float)
-        lag = int((px.index >= s.index[-1]).sum() - 1) if len(s) else 9999
         src.append(dict(name=name, ticker=col if col != "SPX" else "^GSPC",
                         source=origin.get(col, "—"),
-                        last=s.index[-1].strftime("%d %b %Y") if len(s) else "—",
-                        lag=lag, ok=bool(lag <= 3)))
-    for c in ["^VIX", "^VIX9D", "^VIX3M", "^VIX6M"]:
-        px[c] = px[c].ffill(limit=3)
-    px = px.dropna(subset=["SPX", "^VIX", "^VIX9D"])
+                        last=last[col].strftime("%d %b %Y") if last[col] is not None else "—",
+                        lag=lag_of[col], ok=bool(lag_of[col] <= STALE_MAX)))
+    held_back = int((px.index > asof).sum())
+    waiting = [c.lstrip("^") for c in live if last[c] < newest]
+    px = px.loc[:asof]
+    for c in ["^VIX", "^VIX9D", "^VIX3M", "^VIX6M"]:   # interior gaps only
+        lv = px[c].last_valid_index()
+        if lv is not None:
+            px[c] = px[c].ffill(limit=3).where(px.index <= lv)
+    px = px.dropna(subset=REQUIRED)
     px.attrs["sources"] = src
+    px.attrs["held_back"] = held_back
+    px.attrs["waiting"] = waiting
     return px
 
 def trading_days(dte):
@@ -578,6 +602,7 @@ def build_data(px):
         first=px.index[0].strftime("%d %b %Y"),
         n_total=len(px),
         sources=src, n_ok=sum(1 for s in src if s["ok"]),
+        held_back=px.attrs.get("held_back", 0), waiting=px.attrs.get("waiting", []),
         spx=jnum(float(px["SPX"].iloc[-1]), 2),
         iv30=jnum(float(px["^VIX"].iloc[-1]), 1),
         vrp30=jnum(series[30]["cur_vrp"], 1),
@@ -1153,7 +1178,8 @@ function render(){
   el("t-spx").textContent=DATA.spx.toLocaleString("en-US",{minimumFractionDigits:2});
   el("t-iv30").textContent=DATA.iv30.toFixed(1)+"%";
   el("t-vrp30").textContent=(DATA.vrp30>=0?"+":"")+DATA.vrp30.toFixed(1)+"%";
-  el("t-asof").textContent=DATA.asof;
+  el("t-asof").textContent=DATA.asof+(DATA.held_back?" ⏳":"");
+  if(DATA.held_back)el("t-asof").setAttribute("data-tip",`As-of held at the last session for which every close is published — newer data from some sources is not used until ${DATA.waiting.join(", ")} publish (Cboe posts the VIX close the next morning). Nothing is forward-filled, so all figures refer to one date.`);
   el("w-range").textContent=L.win_start+" – "+L.win_end; el("w-sess").textContent="("+N+" trading sessions)";
   // data-source status — computed from real per-ticker freshness, not hardcoded
   const nOk=DATA.n_ok,nSrc=DATA.sources.length,allOk=nOk===nSrc;
