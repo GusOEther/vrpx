@@ -127,6 +127,7 @@ def load():
     # like a finding. The used source is recorded (origin -> Settings tab). Credit
     # quantconnect-47 for both the guard and this correction.
     MIN_ROWS = 1000
+    STALE_MAX = 3                               # sessions behind the newest source = stale
     for yf_sym, cboe_sym in fam_map:
         s, where = None, "—"
         try:
@@ -145,29 +146,55 @@ def load():
         cols[yf_sym] = s
         origin[yf_sym] = where
     px = pd.DataFrame(cols)
+    # Cboe lists ^VIX on US market holidays (~33 since 2022) where nothing else has a
+    # close — not sessions; they would otherwise count as gaps and as lag.
+    px = px[px.drop(columns="^VIX").notna().any(axis=1)]
+    # real sessions that SPX lacks are dropped below — count them: a hole in the index
+    # shifts every "n sessions later" lookup (it mis-resolved a forward-test row).
+    spx_missing = int(px["SPX"].isna().loc[px["SPX"].first_valid_index():].sum())
 
-    # real per-source freshness, measured BEFORE ffill (ffill would mask staleness)
+    # AS-OF = the last session on which every live series has its OWN close. The sources
+    # publish a day's close at different hours; a build running in between used to
+    # forward-fill the late ones and so stamped yesterday's VIX with today's date next to
+    # today's SPX (found 2026-10-05: the forward-test log had recorded every regime one
+    # session late). The trailing edge is never filled — the whole report is held back.
+    REQUIRED = ["SPX", "^VIX", "^VIX9D"]      # a dead one freezes the as-of (stale banner fires)
+    OPTIONAL = ["^VIX3M", "^VIX6M"]           # waited for while live, dropped once dead
+    last = {c: px[c].last_valid_index() for c in REQUIRED + OPTIONAL}
+    dead = [c for c in REQUIRED if last[c] is None]
+    if dead:
+        raise RuntimeError("no data for " + ", ".join(dead))
+    newest = max(d for d in last.values() if d is not None)
+    lag_of = {c: (int((px.index > last[c]).sum()) if last[c] is not None else 9999) for c in last}
+    live = REQUIRED + [c for c in OPTIONAL if lag_of[c] <= STALE_MAX]
+    asof = min(last[c] for c in live)
+    held_back = int((px.index > asof).sum())
+    waiting = [c for c in live if last[c] < newest]
+
     src = []
     for name, col in [("SPX", "SPX"), ("VIX", "^VIX"), ("VIX9D", "^VIX9D"),
                       ("VIX3M", "^VIX3M"), ("VIX6M", "^VIX6M")]:
-        s = px[col].dropna() if col in px else pd.Series(dtype=float)
-        lag = int((px.index >= s.index[-1]).sum() - 1) if len(s) else 9999
         src.append(dict(name=name, ticker=col if col != "SPX" else "^GSPC",
                         source=origin.get(col, "—"),
-                        last=s.index[-1].strftime("%d %b %Y") if len(s) else "—",
-                        lag=lag, ok=bool(lag <= 3)))
-    # close interior gaps (a source drops the odd day) via ffill; COUNT how many rows
+                        last=last[col].strftime("%d %b %Y") if last[col] is not None else "—",
+                        lag=lag_of[col], ok=bool(lag_of[col] <= STALE_MAX)))
+    px = px.loc[:asof]
+    # close INTERIOR gaps (a source drops the odd day) via ffill; COUNT how many rows
     # were carried so the freshness layer can flag the series as degraded, not pretend.
+    # Nothing is carried past a series' own last close.
     fill_counts = {}
     for c in ["^VIX", "^VIX9D", "^VIX3M", "^VIX6M"]:
         s = px[c]
-        interior = s.loc[s.first_valid_index():].isna().sum() if s.first_valid_index() is not None else 0
-        fill_counts[c] = int(interior)
-        px[c] = px[c].ffill(limit=3)
+        fv, lv = s.first_valid_index(), s.last_valid_index()
+        fill_counts[c] = int(s.loc[fv:lv].isna().sum()) if fv is not None else 0
+        px[c] = s.ffill(limit=3).where(px.index <= lv) if lv is not None else s
     for s in src:
         s["filled"] = fill_counts.get(s["ticker"], 0)
-    px = px.dropna(subset=["SPX", "^VIX", "^VIX9D"])
+        s["missing"] = spx_missing if s["name"] == "SPX" else 0
+    px = px.dropna(subset=REQUIRED)
     px.attrs["sources"] = src
+    px.attrs["held_back"] = held_back
+    px.attrs["waiting"] = [("SPX" if c == "SPX" else c.lstrip("^")) for c in waiting]
     return px
 
 def trading_days(dte):
@@ -495,24 +522,32 @@ def forward_test(px, labels, fc):
     date_pos = {d.strftime("%Y-%m-%d"): i for i, d in enumerate(idx)}
     today = idx[-1].strftime("%Y-%m-%d")
 
-    # resolve any pending row whose horizon has now elapsed
+    # The logged forecast (regime/pred/prob) is the live record and never changes. The
+    # OUTCOME is re-derived from the current data on every build, so a transient index
+    # hole or a late-published close cannot freeze a wrong resolution (2026-09-16 had been
+    # resolved one session early after such a hole).
     for row in rows:
-        if row.get("status", "PENDING") == "PENDING":
-            pos = date_pos.get(row["date"])
-            if pos is not None and pos + FC_H < len(idx):
-                actual = lab[pos + FC_H]
-                row["actual"] = actual
-                row["resolved_on"] = idx[pos + FC_H].strftime("%Y-%m-%d")
-                row["status"] = "HIT" if actual == row["pred"] else "MISS"
+        row.setdefault("inputs", "")
+        pos = date_pos.get(row["date"])
+        if pos is None:
+            continue
+        if pos + FC_H < len(idx):
+            actual = lab[pos + FC_H]
+            row["actual"] = actual
+            row["resolved_on"] = idx[pos + FC_H].strftime("%Y-%m-%d")
+            row["status"] = "HIT" if actual == row["pred"] else "MISS"
+        else:
+            row["actual"], row["resolved_on"], row["status"] = "", "", "PENDING"
 
-    # append today's forecast once (idempotent per as-of date)
+    # append today's forecast once (idempotent per as-of date). inputs=complete: built
+    # from closes that were all published for that date (load() holds the as-of back).
     if today not in {r["date"] for r in rows}:
         rows.append(dict(date=today, regime=labels.iloc[-1],
                          pred=fc["top"], prob=fc["top_prob"],
-                         actual="", resolved_on="", status="PENDING"))
+                         actual="", resolved_on="", status="PENDING", inputs="complete"))
 
     # write back (CI commits this)
-    cols = ["date", "regime", "pred", "prob", "actual", "resolved_on", "status"]
+    cols = ["date", "regime", "pred", "prob", "actual", "resolved_on", "status", "inputs"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
@@ -522,10 +557,18 @@ def forward_test(px, labels, fc):
     resolved = [r for r in rows if r["status"] in ("HIT", "MISS")]
     hits = sum(1 for r in resolved if r["status"] == "HIT")
     pending = [r for r in rows if r["status"] == "PENDING"]
+    # rows logged before the as-of fix were built while ^VIX was still one session old
+    # (all 12 checked CI logs, 2026-09-17..10-02) — kept, but reported separately.
+    clean = [r for r in resolved if r["inputs"] == "complete"]
+    clean_hits = sum(1 for r in clean if r["status"] == "HIT")
+    lagged = [r for r in rows if r["inputs"] == "lagged"]
     recent = list(reversed(rows[-15:]))
     return dict(since=rows[0]["date"] if rows else today, n_logged=len(rows),
                 n_resolved=len(resolved), n_pending=len(pending),
                 hits=hits, hit_rate=jnum(hits / len(resolved) * 100, 0) if resolved else None,
+                n_clean=len(clean), clean_hits=clean_hits,
+                clean_rate=jnum(clean_hits / len(clean) * 100, 0) if clean else None,
+                n_lagged=len(lagged), lagged_until=lagged[-1]["date"] if lagged else None,
                 horizon=FC_H, recent=recent)
 
 
@@ -872,6 +915,7 @@ def build_data(px):
         first=px.index[0].strftime("%d %b %Y"),
         n_total=len(px),
         sources=src, n_ok=sum(1 for s in src if s["ok"]),
+        held_back=px.attrs.get("held_back", 0), waiting=px.attrs.get("waiting", []),
         spx=jnum(float(px["SPX"].iloc[-1]), 2),
         iv30=jnum(float(px["^VIX"].iloc[-1]), 1),
         vrp30=jnum(series[30]["cur_vrp"], 1),
@@ -896,6 +940,9 @@ def main():
     print("Downloading SPX + VIX family (free) ...", file=sys.stderr)
     px = load()
     print(f"  {len(px)} sessions, {px.index[0].date()} -> {px.index[-1].date()}", file=sys.stderr)
+    if px.attrs.get("held_back"):
+        print(f"  as-of held back {px.attrs['held_back']} session(s) — waiting for "
+              f"{', '.join(px.attrs['waiting'])}", file=sys.stderr)
     data = build_data(px)
     for c in data["lookbacks"][data["default_lb"]]["cards"]:
         print(f"  {c['dte']:>2}DTE  IV {c['cur_iv']:5.1f}  VRP {c['cur_vrp']:+5.1f}  "
@@ -1489,7 +1536,8 @@ function render(){
   el("t-spx").textContent=DATA.spx.toLocaleString("en-US",{minimumFractionDigits:2});
   el("t-iv30").textContent=DATA.iv30.toFixed(1)+"%";
   el("t-vrp30").textContent=(DATA.vrp30>=0?"+":"")+DATA.vrp30.toFixed(1)+"%";
-  el("t-asof").textContent=DATA.asof;
+  el("t-asof").textContent=DATA.asof+(DATA.held_back?" ⏳":"");
+  if(DATA.held_back)el("t-asof").setAttribute("data-tip",`As-of held at the last session for which every close is published — newer data from some sources is not used until ${DATA.waiting.join(", ")} publish (Cboe posts the VIX close the next morning). Nothing is forward-filled, so all figures refer to one date.`);
   el("w-range").textContent=L.win_start+" – "+L.win_end; el("w-sess").textContent="("+N+" trading sessions)";
   // data-source status — computed from real per-ticker freshness, not hardcoded
   const nOk=DATA.n_ok,nSrc=DATA.sources.length,allOk=nOk===nSrc;
@@ -1600,17 +1648,20 @@ function render(){
   /* FORWARD TEST — genuine out-of-sample, grows forward only */
   const FW=DATA.forward;
   el("fw-title").textContent=`▶ FORWARD TEST · live, out-of-sample · started ${FW.since}`;
-  el("fw-sub").innerHTML=`The honest test: each build logs that day's forecast and marks it HIT/MISS ${FW.horizon} trading days later. Unlike the retroactive curve above, this <b>cannot be curve-fit</b> — it only grows forward. ${FW.n_resolved===0?"<b>No forecasts have resolved yet — building up.</b>":""}`;
+  el("fw-sub").innerHTML=`The honest test: each build logs that day's forecast and marks it HIT/MISS ${FW.horizon} trading days later. Unlike the retroactive curve above, the logged forecast is never changed afterwards — only the outcome is re-read from the current data each build. ${FW.n_resolved===0?"<b>No forecasts have resolved yet — building up.</b>":""}`+
+    (FW.n_lagged?`<br><span class="dim">† The first ${FW.n_lagged} entries (to ${FW.lagged_until}) were logged from partly stale inputs: the build ran before Cboe had published that day's VIX close, so the stated regime is usually the previous session's. They stay in the log and in the total; the clean count below excludes them.</span>`:"");
   el("fw-cards").innerHTML=[
     ["RESOLVED",`${FW.n_resolved}`],
-    ["HIT RATE",FW.hit_rate==null?"— (building up)":`${FW.hit_rate}% (${FW.hits}/${FW.n_resolved})`],
+    ["HIT RATE · ALL",FW.hit_rate==null?"— (building up)":`${FW.hit_rate}% (${FW.hits}/${FW.n_resolved})`],
+    ["HIT RATE · CLEAN INPUTS",FW.clean_rate==null?`— (${FW.n_clean} resolved yet)`:`${FW.clean_rate}% (${FW.clean_hits}/${FW.n_clean})`],
     ["PENDING",`${FW.n_pending}`],
   ].map(([k,v])=>`<div class="reg-cell"><div class="rk">${k}</div><div class="rv">${v}</div></div>`).join("");
-  el("fw-tbl").querySelector("tbody").innerHTML=FW.recent.length?FW.recent.map(j=>`<tr><td>${j.date}</td><td><span style="color:${cv(REG_COLOR_JS(j.regime))}">${j.regime}</span></td><td>${j.pred}</td><td>${j.prob}%</td><td>${j.resolved_on||"—"}</td><td>${j.actual||"—"}</td><td class="${j.status==='HIT'?'good':j.status==='MISS'?'bad':''}">${j.status}</td></tr>`).join(""):`<tr><td colspan="7" class="dim">No entries yet — the first build logs today's forecast.</td></tr>`;
+  el("fw-tbl").querySelector("tbody").innerHTML=FW.recent.length?FW.recent.map(j=>`<tr><td>${j.date}${j.inputs==="lagged"?' <span class="dim" title="logged from partly stale inputs">†</span>':""}</td><td><span style="color:${cv(REG_COLOR_JS(j.regime))}">${j.regime}</span></td><td>${j.pred}</td><td>${j.prob}%</td><td>${j.resolved_on||"—"}</td><td>${j.actual||"—"}</td><td class="${j.status==='HIT'?'good':j.status==='MISS'?'bad':''}">${j.status}</td></tr>`).join(""):`<tr><td colspan="7" class="dim">No entries yet — the first build logs today's forecast.</td></tr>`;
 
   /* SETTINGS */
   el("set-src").innerHTML=DATA.sources.map(s=>
-    `<div class="row"><span class="rk">${s.name}</span><span class="rv">${s.ticker} · ${s.source||"—"} · last ${s.last} · <span class="${s.ok?"chk":"chx"}">${s.ok?"✓ fresh":"✗ stale ("+s.lag+" sessions)"}</span>${s.filled?` · <span class="chx" title="interior gaps carried forward (ffill)">⚠ ${s.filled} filled</span>`:""}</span></div>`).join("");
+    `<div class="row"><span class="rk">${s.name}</span><span class="rv">${s.ticker} · ${s.source||"—"} · last ${s.last} · <span class="${s.ok?"chk":"chx"}">${s.ok?"✓ fresh":"✗ stale ("+s.lag+" sessions)"}</span>${s.filled?` · <span class="chx" title="interior gaps carried forward (ffill)">⚠ ${s.filled} filled</span>`:""}${s.missing?` · <span class="chx" title="sessions this source lacks; dropped from the index">⚠ ${s.missing} missing</span>`:""}</span></div>`).join("")+
+    (DATA.held_back?`<div class="row"><span class="rk">AS-OF HELD</span><span class="rv">${DATA.asof} — waiting for ${DATA.waiting.join(", ")} (${DATA.held_back} newer session${DATA.held_back>1?"s":""} not used yet; nothing forward-filled)</span></div>`:"");
   el("set-par").innerHTML=[["History start",DATA.first],["As of",DATA.asof],["Total sessions",DATA.n_total],["DTE horizons",DATA.dtes.join(" / ")],["Lookbacks",Object.values(DATA.lookbacks).map(l=>l.name).join(" · ")],["Term nodes (days)",Object.entries(DATA.node_days).map(([k,v])=>k+"="+v).join(" · ")],["Forecast horizon",DATA.forecast.horizon+" trading days (streak-adjusted persistence)"]].map(([k,x])=>`<div class="row"><span class="rk">${k}</span><span class="rv">${x}</span></div>`).join("");
   el("set-w").innerHTML=Object.entries(DATA.weights).map(([k,x])=>`<div class="row"><span class="rk">${k.toUpperCase()}</span><span class="rv">${x}%</span></div>`).join("");
   el("set-subs").innerHTML=`<b style="color:var(--ink-dim)">RICH</b> — richness: percentile of current VRP within this DTE's own trailing history (rich IV vs its norm).<br><b style="color:var(--ink-dim)">CARRY</b> — carry per day: VRP ÷ calendar days, ranked across the DTE set (which tenor pays most premium per day now, relative).<br><b style="color:var(--ink-dim)">SAFETY</b> — merged reliability (info ratio = mean ÷ std of forward VRP) + tail-safety (1 − |CVaR₅|). These two were measured to be redundant (Spearman +0.89 on the real definitions, 2026-08-26), so they are one axis to avoid double-counting.<br><b style="color:var(--ink-dim)">PATH</b> — path-safety: trailing mean Max Adverse Excursion of the SPX price path over the forward window, inverted percentile within its own window history. A genuine <i>path</i> axis (the price journey), distinct from SAFETY's VRP-outcome tail.<br><b style="color:var(--ink-dim)">STAB</b> — stability: steadiness of recent VRP vs its window dispersion.<br>Five decorrelated axes — level, cross-sectional carry, outcome safety, path safety, steadiness — so the composite doesn't double-count. <b>Note:</b> the composite ranks premium <i>quality/safety</i>, not expected P&L — measured (2026-08-26) low-vol conditions precede weaker short-vol returns (complacency).`;
