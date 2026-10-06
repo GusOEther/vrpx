@@ -149,6 +149,10 @@ def load():
     # Cboe lists ^VIX on US market holidays (~33 since 2022) where nothing else has a
     # close — not sessions; they would otherwise count as gaps and as lag.
     px = px[px.drop(columns="^VIX").notna().any(axis=1)]
+    # a session counts only once it is over (17:00 New York): Yahoo serves the running
+    # session as a daily row, which a push/dispatch or late run would otherwise log.
+    now_ny = pd.Timestamp.now(tz="America/New_York").tz_localize(None)
+    px = px[px.index + pd.Timedelta(hours=17) <= now_ny]
     # real sessions that SPX lacks are dropped below — count them: a hole in the index
     # shifts every "n sessions later" lookup (it mis-resolved a forward-test row).
     spx_missing = int(px["SPX"].isna().loc[px["SPX"].first_valid_index():].sum())
@@ -158,8 +162,10 @@ def load():
     # forward-fill the late ones and so stamped yesterday's VIX with today's date next to
     # today's SPX (found 2026-10-05: the forward-test log had recorded every regime one
     # session late). The trailing edge is never filled — the whole report is held back.
-    REQUIRED = ["SPX", "^VIX", "^VIX9D"]      # a dead one freezes the as-of (stale banner fires)
-    OPTIONAL = ["^VIX3M", "^VIX6M"]           # waited for while live, dropped once dead
+    # VIX3M is required: it sets the term slope, and a regime label from a fabricated
+    # slope is worse than a frozen page. VIX6M is display-only.
+    REQUIRED = ["SPX", "^VIX", "^VIX9D", "^VIX3M"]   # a dead one freezes the as-of (stale banner)
+    OPTIONAL = ["^VIX6M"]                            # waited for while live, dropped once dead
     last = {c: px[c].last_valid_index() for c in REQUIRED + OPTIONAL}
     dead = [c for c in REQUIRED if last[c] is None]
     if dead:
@@ -191,7 +197,9 @@ def load():
     for s in src:
         s["filled"] = fill_counts.get(s["ticker"], 0)
         s["missing"] = spx_missing if s["name"] == "SPX" else 0
+    calendar = px.index.copy()               # every session, incl. ones a source lacks
     px = px.dropna(subset=REQUIRED)
+    px.attrs["calendar"] = calendar
     px.attrs["sources"] = src
     px.attrs["held_back"] = held_back
     px.attrs["waiting"] = [("SPX" if c == "SPX" else c.lstrip("^")) for c in waiting]
@@ -301,7 +309,7 @@ def cards_for(series, N):
 # --------------------------------------------------------------------------- #
 def regime_series(px):
     vix   = px["^VIX"]
-    v3m   = px["^VIX3M"].fillna(px["^VIX"])
+    v3m   = px["^VIX3M"]
     slope = v3m / vix
     up    = px["SPX"] > px["SPX"].rolling(200).mean()
     cond = [vix >= 40,
@@ -327,7 +335,7 @@ def transition_matrix(labels):
 def regime_block(px, labels, slope, up, vrp_hist30, vrp_now30):
     cur = labels.iloc[-1]
     vix = float(px["^VIX"].iloc[-1])
-    v3m = float(px["^VIX3M"].fillna(px["^VIX"]).iloc[-1])
+    v3m = float(px["^VIX3M"].iloc[-1])
     sl  = float(slope.iloc[-1])
     ret20 = float(px["SPX"].iloc[-1] / px["SPX"].iloc[-21] - 1) * 100
 
@@ -566,36 +574,55 @@ def forward_test(px, labels, fc):
             rows = list(csv.DictReader(f))
 
     idx = labels.index
-    lab = labels.to_numpy()
-    date_pos = {d.strftime("%Y-%m-%d"): i for i, d in enumerate(idx)}
+    cal = px.attrs.get("calendar", idx)       # full session calendar (a source may lack a day)
+    cal = cal[cal <= idx[-1]]
+    cal_pos = {d.strftime("%Y-%m-%d"): i for i, d in enumerate(cal)}
     today = idx[-1].strftime("%Y-%m-%d")
 
     # The logged forecast (regime/pred/prob) is the live record and never changes. The
-    # OUTCOME is re-derived from the current data on every build, so a transient index
-    # hole or a late-published close cannot freeze a wrong resolution (2026-09-16 had been
-    # resolved one session early after such a hole).
+    # OUTCOME is re-derived from the current data on every build, against the session
+    # CALENDAR (not index positions): a session a source drops for one build can then
+    # neither shift the target date nor flip a status — the stored outcome is kept until
+    # the target session is back (2026-09-16 had been resolved one session early).
     for row in rows:
-        row.setdefault("inputs", "")
-        pos = date_pos.get(row["date"])
+        row.setdefault("inputs", ""); row.setdefault("mode", "live")
+        pos = cal_pos.get(row["date"])
         if pos is None:
             continue
-        if pos + FC_H < len(idx):
-            actual = lab[pos + FC_H]
-            row["actual"] = actual
-            row["resolved_on"] = idx[pos + FC_H].strftime("%Y-%m-%d")
-            row["status"] = "HIT" if actual == row["pred"] else "MISS"
-        else:
+        if pos + FC_H < len(cal):
+            tgt = cal[pos + FC_H]
+            if tgt in idx:
+                actual = labels.loc[tgt]
+                row["actual"] = actual
+                row["resolved_on"] = tgt.strftime("%Y-%m-%d")
+                row["status"] = "HIT" if actual == row["pred"] else "MISS"
+        elif row["status"] != "SKIPPED":
             row["actual"], row["resolved_on"], row["status"] = "", "", "PENDING"
 
-    # append today's forecast once (idempotent per as-of date). inputs=complete: built
-    # from closes that were all published for that date (load() holds the as-of back).
-    if today not in {r["date"] for r in rows}:
-        rows.append(dict(date=today, regime=labels.iloc[-1],
-                         pred=fc["top"], prob=fc["top_prob"],
-                         actual="", resolved_on="", status="PENDING", inputs="complete"))
+    # append every session since the last logged one (idempotent per date). A session a
+    # failed or held-back build never logged is filled by causal replay on data up to that
+    # day (mode=backfill) while its outcome is still unknown; once the outcome is visible a
+    # late forecast would be hindsight, so it is recorded as SKIPPED instead.
+    # inputs=complete: load() holds the as-of until every close of that date is published.
+    logged = {r["date"] for r in rows}
+    last = max(logged) if logged else today
+    for d in idx[idx > pd.Timestamp(last)] if logged else idx[-1:]:
+        ds = d.strftime("%Y-%m-%d")
+        if ds in logged:
+            continue
+        if d == idx[-1]:
+            f, mode = fc, "live"
+        elif cal_pos.get(ds, len(cal)) + FC_H >= len(cal):
+            f, mode = forecast_block(px.loc[:d], labels.loc[:d]), "backfill"
+        else:
+            rows.append(dict(date=ds, regime=labels.loc[d], pred="", prob="", actual="",
+                             resolved_on="", status="SKIPPED", inputs="", mode="skipped"))
+            continue
+        rows.append(dict(date=ds, regime=labels.loc[d], pred=f["top"], prob=f["top_prob"],
+                         actual="", resolved_on="", status="PENDING", inputs="complete", mode=mode))
 
     # write back (CI commits this)
-    cols = ["date", "regime", "pred", "prob", "actual", "resolved_on", "status", "inputs"]
+    cols = ["date", "regime", "pred", "prob", "actual", "resolved_on", "status", "inputs", "mode"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
@@ -615,7 +642,9 @@ def forward_test(px, labels, fc):
     base_hits = sum(1 for r in resolved if r["actual"] == r["regime"])
     expected = sum(float(r["prob"]) for r in resolved) / 100.0
     fam_hits = sum(1 for r in resolved if FAMILY_OF.get(r["actual"]) == FAMILY_OF.get(r["pred"]))
-    all_stay = all(r["pred"] == r["regime"] for r in rows)
+    all_stay = all(r["pred"] == r["regime"] for r in rows if r["pred"])
+    n_skipped = sum(1 for r in rows if r["status"] == "SKIPPED")
+    n_backfill = sum(1 for r in rows if r.get("mode") == "backfill")
     recent = list(reversed(rows[-15:]))
     return dict(since=rows[0]["date"] if rows else today, n_logged=len(rows),
                 n_resolved=len(resolved), n_pending=len(pending),
@@ -624,7 +653,9 @@ def forward_test(px, labels, fc):
                 all_stay=all_stay, n_indep=len(resolved) // FC_H,
                 n_clean=len(clean), clean_hits=clean_hits,
                 clean_rate=jnum(clean_hits / len(clean) * 100, 0) if clean else None,
-                n_lagged=len(lagged), lagged_until=lagged[-1]["date"] if lagged else None,
+                n_lagged=len(lagged), lagged_from=lagged[0]["date"] if lagged else None,
+                lagged_until=lagged[-1]["date"] if lagged else None,
+                n_skipped=n_skipped, n_backfill=n_backfill,
                 horizon=FC_H, recent=recent)
 
 
@@ -677,7 +708,7 @@ def analog_block(px, labels):
     feats = pd.DataFrame({
         "vix":  px["^VIX"],
         "v9v":  px["^VIX9D"] / px["^VIX"],
-        "vv3m": px["^VIX"] / px["^VIX3M"].fillna(px["^VIX"]),
+        "vv3m": px["^VIX"] / px["^VIX3M"],
         "rvc":  (r.rolling(10).std() - r.rolling(63).std()) * ann,
         "er21": (p - p.shift(21)).abs() / p.diff().abs().rolling(21).sum(),
     }).dropna()
@@ -1666,7 +1697,7 @@ function render(){
   el("t-iv30").textContent=DATA.iv30.toFixed(1)+"%";
   el("t-vrp30").textContent=(DATA.vrp30>=0?"+":"")+DATA.vrp30.toFixed(1)+"%";
   el("t-asof").textContent=DATA.asof+(DATA.held_back?" ⏳":"");
-  if(DATA.held_back)el("t-asof").setAttribute("data-tip",`As-of held at the last session for which every close is published — newer data from some sources is not used until ${DATA.waiting.join(", ")} publish (Cboe posts the VIX close the next morning). Nothing is forward-filled, so all figures refer to one date.`);
+  if(DATA.held_back)el("t-asof").setAttribute("data-tip",`As-of held at the last session for which every close is published — newer data is not used until ${DATA.waiting.join(", ")} ${DATA.waiting.length>1?"are":"is"} published (Cboe posts the VIX close the next morning). Nothing is forward-filled, so all figures refer to one date.`);
   el("w-range").textContent=L.win_start+" – "+L.win_end; el("w-sess").textContent="("+N+" trading sessions)";
   // data-source status — computed from real per-ticker freshness, not hardcoded
   const nOk=DATA.n_ok,nSrc=DATA.sources.length,allOk=nOk===nSrc;
@@ -1800,7 +1831,8 @@ function render(){
   el("fw-title").textContent=`▶ FORWARD TEST · live, out-of-sample · started ${FW.since}`;
   el("fw-sub").innerHTML=`The honest test: each build logs that day's forecast and marks it HIT/MISS ${FW.horizon} trading days later. Unlike the retroactive curve above, the logged forecast is never changed afterwards — only the outcome is re-read from the current data each build. ${FW.n_resolved===0?"<b>No forecasts have resolved yet — building up.</b>":""}`+
     (FW.all_stay&&FW.n_resolved?` So far every logged top forecast was "regime stays", so the hit rate equals the no-change baseline by construction; "model expected" is the sum of the logged probabilities — what the model itself promised. Five-day targets overlap, so ${FW.n_resolved} resolved rows are only ≈${FW.n_indep} independent outcomes.`:"")+
-    (FW.n_lagged?`<br><span class="dim">† The first ${FW.n_lagged} entries (to ${FW.lagged_until}) were logged from partly stale inputs: the build ran before Cboe had published that day's VIX close, so the stated regime is usually the previous session's. They stay in the log and in the total; the clean count below excludes them.</span>`:"");
+    (FW.n_lagged?`<br><span class="dim">† ${FW.n_lagged} entries (${FW.lagged_from} – ${FW.lagged_until}) were logged from partly stale inputs: the build ran before Cboe had published that day's VIX close, so the stated regime is usually the previous session's. They stay in the log and in the total; the clean count below excludes them.</span>`:"")+
+    (FW.n_backfill||FW.n_skipped?`<br><span class="dim">${FW.n_backfill} entr${FW.n_backfill===1?"y was":"ies were"} backfilled (a build was missed; forecast replayed on data up to that day while the outcome was still unknown, marked ↺); ${FW.n_skipped} session${FW.n_skipped===1?" was":"s were"} missed too long and are marked SKIPPED, not forecast in hindsight.</span>`:"");
   el("fw-cards").innerHTML=[
     ["RESOLVED · PENDING",`${FW.n_resolved} · ${FW.n_pending} <span class="dim" style="font-size:11px">(≈${FW.n_indep} independent)</span>`],
     ["HIT RATE · ALL",FW.hit_rate==null?"— (building up)":`${FW.hit_rate}% (${FW.hits}/${FW.n_resolved})`],
@@ -1809,7 +1841,7 @@ function render(){
     ["FAMILY HIT",FW.n_resolved?`${FW.fam_hits}/${FW.n_resolved}`:"—"],
     ["HIT RATE · CLEAN INPUTS",FW.clean_rate==null?`— (${FW.n_clean} resolved yet)`:`${FW.clean_rate}% (${FW.clean_hits}/${FW.n_clean})`],
   ].map(([k,v])=>`<div class="reg-cell"><div class="rk">${k}</div><div class="rv">${v}</div></div>`).join("");
-  el("fw-tbl").querySelector("tbody").innerHTML=FW.recent.length?FW.recent.map(j=>`<tr><td>${j.date}${j.inputs==="lagged"?' <span class="dim" title="logged from partly stale inputs">†</span>':""}</td><td><span style="color:${cv(REG_COLOR_JS(j.regime))}">${j.regime}</span></td><td>${j.pred}</td><td>${j.prob}%</td><td>${j.resolved_on||"—"}</td><td>${j.actual||"—"}</td><td class="${j.status==='HIT'?'good':j.status==='MISS'?'bad':''}">${j.status}</td></tr>`).join(""):`<tr><td colspan="7" class="dim">No entries yet — the first build logs today's forecast.</td></tr>`;
+  el("fw-tbl").querySelector("tbody").innerHTML=FW.recent.length?FW.recent.map(j=>`<tr><td>${j.date}${j.inputs==="lagged"?' <span class="dim" title="logged from partly stale inputs">†</span>':""}${j.mode==="backfill"?' <span class="dim" title="backfilled by causal replay after a missed build">↺</span>':""}</td><td><span style="color:${cv(REG_COLOR_JS(j.regime))}">${j.regime}</span></td><td>${j.pred||"—"}</td><td>${j.prob?j.prob+"%":"—"}</td><td>${j.resolved_on||"—"}</td><td>${j.actual||"—"}</td><td class="${j.status==='HIT'?'good':j.status==='MISS'?'bad':''}">${j.status}</td></tr>`).join(""):`<tr><td colspan="7" class="dim">No entries yet — the first build logs today's forecast.</td></tr>`;
 
   /* SETTINGS */
   el("set-src").innerHTML=DATA.sources.map(s=>
