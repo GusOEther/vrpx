@@ -1006,7 +1006,23 @@ def backtest_block(px, iv30, labels, vrp_now30, rate):
         "Calendar 9/30 (ATM call)": dict(regime=per_regime(pnl_cal, lab_c), quintile=per_quintile(pnl_cal, vrp_c)),
     }
 
+    # Sensitivity to the ATM-vol input: the VIX is a variance strip and sits ABOVE true
+    # ATM implied vol under the usual skew; the gap is not observable in free data. Reprice
+    # the short-vol structures with ATM vol = VIX - h (strikes follow). The closures read
+    # sig0 at call time, so rebinding it reprices everything consistently.
+    sig_base, sens = sig0, []
+    for h in (0, 1, 2):
+        sig0 = np.maximum(sig_base - h / 100.0, 0.01)
+        row = dict(h=h)
+        for nm, fn in (("Straddle (ATM)", straddle), ("Strangle (16Δ)", strangle),
+                       ("Iron Condor (16/5Δ)", condor)):
+            x = fn(False)
+            row[nm] = dict(mean=jnum(np.nanmean(x), 2), hit=jnum((x > 0).mean() * 100, 0))
+        sens.append(row)
+    sig0 = sig_base
+
     return dict(
+        sens=sens,
         params=dict(dte=BT_DTE, slip=int(BT_SLIP * 100), q=BT_Q, exp_td=n_exp,
                     rate="^IRX 13w T-bill", unit="% of spot notional", years=jnum(yrs, 1),
                     skew_dn=SKEW_DN, skew_up=SKEW_UP, cal_front_td=n_f),
@@ -1387,6 +1403,9 @@ TEMPLATE = r"""<meta charset="utf-8">
       <div class="box"><div class="box-title" id="bt-reg-title"></div>
         <table class="tbl" id="bt-reg"><thead><tr><th>Regime</th><th>Trades</th><th>Avg P&L %</th><th>Win rate</th><th>5th pct</th><th>Worst</th></tr></thead><tbody></tbody></table></div>
     </div>
+    <div class="box"><div class="box-title">▶ SENSITIVITY · what if true ATM vol sits below the VIX? · flat pricing, all daily entries</div>
+      <table class="tbl" id="bt-sens"><thead><tr><th>ATM vol input</th><th>Straddle (ATM) mean · win</th><th>Strangle (16Δ) mean · win</th><th>Iron Condor (16/5Δ) mean · win</th></tr></thead><tbody></tbody></table>
+      <div class="box-note">The backtest prices options off the VIX, a 30-day variance strip that includes the expensive downside wings, so it sits above true at-the-money implied vol. Free data does not show by how much, so the table reprices the short-vol structures with ATM vol = VIX − 1 and − 2 vol points (strikes follow). Read the headline results as an upper bound and check whether a conclusion survives the lower rows.</div></div>
     <div class="box"><div class="box-title">▶ METHOD & CAVEATS</div><div class="box-note" id="bt-note" style="font-size:11px"></div></div>
   </div>
 
@@ -1443,7 +1462,7 @@ TEMPLATE = r"""<meta charset="utf-8">
         <tr><td>COMPOSITE</td><td>Premium quality/safety across DTEs</td><td>A ranking of <i>safety</i>, NOT expected P&amp;L — measured, calm conditions precede weaker short-vol returns (complacency). Read <i>why</i> via the four bars</td></tr>
         <tr><td>Slope VIX3M/VIX</td><td>Term-structure state</td><td>≥ 1 contango = carry-friendly · &lt; 1 backwardation · &lt; 0.97 = STRESS rule</td></tr>
         <tr><td>Validation quintiles</td><td>Does a richer signal pay more forward?</td><td>A rise across <i>all</i> of Q1→Q5 would mean graded information; the verdict line says whether it holds</td></tr>
-        <tr><td>RV SPREAD</td><td>rv10 − rv63: realized vol accelerating?</td><td class="warn">&gt; 0 in CALM/STEADY = measured drag on short vol. No rule in TRANSITION (sign flips)</td></tr>
+        <tr><td>RV SPREAD</td><td>rv10 − rv63: realized vol accelerating?</td><td class="warn">&gt; 0 in CALM/STEADY = drag on short vol, measured 2011+ (straddle ≈ −0.4 to −0.5 pp/trade). A 2006–10 holdout showed the same sign but too few carry days to confirm — in-sample evidence. No rule in TRANSITION (sign flips)</td></tr>
         <tr><td>Expected move</td><td>IV-implied ±1σ range per DTE</td><td class="warn">SPX finished inside it far more often than 68% — that excess IS the premium; the tail beyond −2σ is the price</td></tr>
         <tr><td>Forecast reliability</td><td>Is the regime forecast well-calibrated?</td><td>Confidence vs actual accuracy per bucket; the top pick is nearly always "regime stays" — its edge is in the probabilities</td></tr>
         <tr><td>Analog engine</td><td>What followed similar historical states?</td><td>Context, not alpha — measured fwd-RV skill only; return prediction ≈ 0</td></tr>
@@ -1614,7 +1633,7 @@ function tradeContext(c,reg){
   // rv_composite drag (spec §6): in CALM/STEADY a positive rv10−rv63 measurably precedes
   // weaker short-vol P&L. Only these two regimes (TRANSITION flips sign).
   const rvcDrag=calm&&reg.rvc_accel;
-  const rvcEv=rvcDrag?` · ⚠ RV accelerating (rv10−rv63 +${num(reg.rvc,2)}) — measured drag on short vol`:'';
+  const rvcEv=rvcDrag?` · ⚠ RV accelerating (rv10−rv63 +${num(reg.rvc,2)}) — drag on short vol, in-sample 2011+ (holdout 2006–10: same sign, too few days to confirm)`:'';
   // Short vol, defined/limited risk — cut-offs: Favored mean≥0.3 & win≥65 · Caution mean<0 or win<60
   [["Iron Condor (16/5Δ)","Iron Condor (16/5Δ)","defined risk"],["Short Strangle (16Δ)","Strangle (16Δ)","undefined risk, OTM"]].forEach(([name,key,kind])=>{
     const s=bd(key); if(!s)return;
@@ -1688,6 +1707,7 @@ function renderBacktest(){
   el("bt-reg-title").textContent=`▶ ${state.btStrat} · P&L BY ENTRY REGIME · flat, all daily entries, ${cadence}`;
   el("bt-q").querySelector("tbody").innerHTML=bd.quintile.map(b=>`<tr><td>Q${b.q}${b.q===1?" (cheap)":b.q===bd.quintile.length?" (rich)":""}</td><td>${num(b.sig,2)}</td><td>${num(b.pnl,2)}</td><td>${num(b.hit,0)}%</td></tr>`).join("");
   el("bt-reg").querySelector("tbody").innerHTML=bd.regime.map(b=>{const i=DATA.regime.order.indexOf(b.regime);return `<tr><td data-tip="${REGTIP[b.regime]||""}"><span style="color:${cv(DATA.regime.colors[i])}">■</span> ${b.regime}</td><td>${b.n}</td><td>${num(b.mean,2)}</td><td>${num(b.hit,0)}%</td><td>${num(b.p5,1)}</td><td>${num(b.worst,1)}</td></tr>`;}).join("");
+  el("bt-sens").querySelector("tbody").innerHTML=bt.sens.map(r=>`<tr><td>${r.h?`VIX − ${r.h} vol pt${r.h>1?"s":""}`:"VIX (as used above)"}</td>`+["Straddle (ATM)","Strangle (16Δ)","Iron Condor (16/5Δ)"].map(k=>`<td class="${r[k].mean<0?"bad":""}">${r[k].mean>=0?"+":""}${num(r[k].mean,2)}%/tr · ${num(r[k].hit,0)}%</td>`).join("")+"</tr>").join("");
   el("bt-note").innerHTML=`Prices are <b>reconstructed</b> with Black-Scholes, using the VIX (a 30-day variance-strip index) as the ATM-vol input (no free option-quote history). Under the usual skew the VIX sits above true ATM implied vol, so short-vol P&L here is biased upward — spot ^GSPC, rate ${P.rate}, dividend q=${P.q}. <b>Skew</b> (toggle) is a parametric approximation: IV(K)=IV_atm·(1+slope·(−m)), put slope ${P.skew_dn} / call slope ${P.skew_up} of standardized moneyness — a typical SPX smirk, <b>not</b> real per-strike quotes. Strikes for the 16Δ/5Δ legs are placed off the ATM vol. Also <b>no real bid-ask</b> (flat ${P.slip}% cost), settlement at expiry from the actual SPX path, P&L in % of spot notional (not margin — real leveraged returns and risk are higher). Good for <b>relative</b> comparison, not exact fills.`;
 }
 
@@ -1753,7 +1773,7 @@ function render(){
 
   /* REGIME ANALYSIS */
   const rvcTxt=(reg.rvc>=0?"+":"")+reg.rvc+(reg.rvc_accel?" ⚠ accel":" (calm)");
-  el("reg-grid").innerHTML=[["REGIME",reg.label+` · day ${DATA.regime.run.days}`],["VIX3M/VIX SLOPE",reg.slope+" ("+reg.slope_txt+")"],["VIX",reg.vix+"  ("+ord(reg.vix_pct)+" pct)"],["RV SPREAD (rv10−rv63)",rvcTxt],["SPX STATE",reg.spx_state],["20-DAY RETURN",(reg.ret20>=0?"+":"")+reg.ret20+"%"]].map(([k,v])=>`<div class="reg-cell" data-tip="${k.indexOf('RV SPREAD')===0?'rv10 − rv63 in vol points: >0 = realized vol accelerating vs its quarter norm. In CALM/STEADY a positive value measurably preceded weaker short-vol P&L; no rule in TRANSITION (sign flips there).':''}"><div class="rk">${k}</div><div class="rv">${v}</div></div>`).join("");
+  el("reg-grid").innerHTML=[["REGIME",reg.label+` · day ${DATA.regime.run.days}`],["VIX3M/VIX SLOPE",reg.slope+" ("+reg.slope_txt+")"],["VIX",reg.vix+"  ("+ord(reg.vix_pct)+" pct)"],["RV SPREAD (rv10−rv63)",rvcTxt],["SPX STATE",reg.spx_state],["20-DAY RETURN",(reg.ret20>=0?"+":"")+reg.ret20+"%"]].map(([k,v])=>`<div class="reg-cell" data-tip="${k.indexOf('RV SPREAD')===0?'rv10 − rv63 in vol points: >0 = realized vol accelerating vs its quarter norm. In CALM/STEADY a positive value preceded weaker short-vol P&L in 2011+ (in-sample; a 2006–10 holdout had the same sign but too few carry days to confirm). No rule in TRANSITION (sign flips there).':''}"><div class="rk">${k}</div><div class="rv">${v}</div></div>`).join("");
   el("term-snap").innerHTML=DATA.term.length>1?svgTermSnap():'<div class="dim">term structure unavailable</div>';
   const per=DATA.regime.per_regime, perWraw=(DATA.regime.per_regime_lb||{})[state.lb]||{}, perNA=!!perWraw.na, perW=perNA?{}:perWraw;
   el("reg-tbl-title").textContent=`▶ PER-REGIME EVIDENCE · forward VRP-30 · full history vs selected window (${N} sessions)`;
