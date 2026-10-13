@@ -2,9 +2,10 @@ name: build-and-deploy
 
 on:
   schedule:
-    # Mon–Sat 11:00 UTC = previous US session. Cboe publishes VIX9D/3M/6M ~22:30 UTC but
-    # the VIX close only the next morning (~08:30 UTC; every 23:30 run 2026-09-17..10-02
-    # read the previous day's VIX). 11:00 UTC is before the US open in both DST states.
+    # Mon–Sat 11:00 UTC = previous US session. Cboe publishes VIX9D/3M/6M ~22:30-23:00 UTC
+    # but the VIX close only overnight (seen between ~02:00 and 08:30 UTC; every 23:30 run
+    # 2026-09-17..10-02 read the previous day's VIX). 11:00 UTC is before the US open in both
+    # DST states; load() additionally holds the as-of until every close is published.
     - cron: "0 11 * * 1-6"
   workflow_dispatch:           # manual runs from the Actions tab
   push:
@@ -66,16 +67,34 @@ jobs:
           mkdir -p ../dist/preview
           cp vrpx_report.html ../dist/preview/index.html
 
+      # Pages publishes dist as the WHOLE site: without this a failed preview build would
+      # turn /preview/ into a 404 while the run stays green.
+      - name: Keep last good preview if the v2 build failed
+        if: steps.preview.outcome != 'success'
+        run: |
+          mkdir -p dist/preview
+          if curl -fsSL https://gusoether.github.io/vrpx/preview/ -o dist/preview/index.html; then
+            echo "::warning::v2 preview build failed — redeployed the last live preview"
+          else
+            rm -f dist/preview/index.html
+            echo "::warning::v2 preview build failed and no previous preview could be fetched"
+          fi
+
+      # The log commit must never block the deploy (continue-on-error); a push race with a
+      # human push to v2 is retried once after a rebase, a lost session is backfilled by
+      # the next build's forward_test.
       - name: Commit v2 forward-test log
         if: steps.preview.outcome == 'success'
+        continue-on-error: true
         run: |
           cd v2src
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add forecast_forward.csv
           if ! git diff --staged --quiet; then
-            git commit -m "forward-test: log/resolve $(date -u +%F) [skip ci]"
-            git push origin HEAD:v2
+            ASOF=$(tail -n 1 forecast_forward.csv | cut -d, -f1)
+            git commit -m "forward-test: log/resolve as-of $ASOF [skip ci]"
+            git push origin HEAD:v2 || (git pull --rebase origin v2 && git push origin HEAD:v2)               || echo "::warning::forward log not pushed — next build backfills"
           else
             echo "no forward-test change"
           fi

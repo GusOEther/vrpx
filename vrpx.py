@@ -134,19 +134,25 @@ def load():
                     s, where = y, "Yahoo (fallback)"
             except Exception:
                 pass
-        cols[yf_sym] = s
+        cols[yf_sym] = s if s is not None else pd.Series(dtype=float)   # dead -> NaN, not a crash
         origin[yf_sym] = where
     px = pd.DataFrame(cols)
     # Cboe lists ^VIX on US market holidays where nothing else has a close — not sessions.
     px = px[px.drop(columns="^VIX").notna().any(axis=1)]
+    # a session counts only once it is over (17:00 New York): Yahoo serves the running
+    # session as a daily row, which a push/dispatch or late run would otherwise use.
+    now_ny = pd.Timestamp.now(tz="America/New_York").tz_localize(None)
+    px = px[px.index + pd.Timedelta(hours=17) <= now_ny]
 
     # AS-OF = the last session on which every live series has its OWN close. Cboe posts
     # the VIX close only the next morning (~08:30 UTC); a build in between used to
     # forward-fill it and stamped yesterday's VIX with today's date (found 2026-10-05).
     # The trailing edge is never filled — the whole report is held back instead.
     STALE_MAX = 3
-    REQUIRED = ["SPX", "^VIX", "^VIX9D"]
-    OPTIONAL = ["^VIX3M", "^VIX6M"]           # waited for while live, dropped once dead
+    # VIX3M sets the term slope; a regime label from a fabricated slope (VIX3M := VIX)
+    # is worse than a frozen page, so it is required. VIX6M is display-only.
+    REQUIRED = ["SPX", "^VIX", "^VIX9D", "^VIX3M"]
+    OPTIONAL = ["^VIX6M"]                     # waited for while live, dropped once dead
     last = {c: px[c].last_valid_index() for c in REQUIRED + OPTIONAL}
     dead = [c for c in REQUIRED if last[c] is None]
     if dead:
@@ -257,7 +263,7 @@ def cards_for(series, N):
 # --------------------------------------------------------------------------- #
 def regime_series(px):
     vix   = px["^VIX"]
-    v3m   = px["^VIX3M"].fillna(px["^VIX"])
+    v3m   = px["^VIX3M"]
     slope = v3m / vix
     up    = px["SPX"] > px["SPX"].rolling(200).mean()
     cond = [vix >= 40,
@@ -283,7 +289,7 @@ def transition_matrix(labels):
 def regime_block(px, labels, slope, up, vrp_hist30, vrp_now30):
     cur = labels.iloc[-1]
     vix = float(px["^VIX"].iloc[-1])
-    v3m = float(px["^VIX3M"].fillna(px["^VIX"]).iloc[-1])
+    v3m = float(px["^VIX3M"].iloc[-1])
     sl  = float(slope.iloc[-1])
     ret20 = float(px["SPX"].iloc[-1] / px["SPX"].iloc[-21] - 1) * 100
 
