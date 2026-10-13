@@ -53,9 +53,12 @@ Z05C, Z05P = -1.6449,  1.6449         #  5-delta wings (iron-condor longs)
 # ~25d risk-reversal of ~4-5 vol pts on ~16 ATM. Constants are editable.
 SKEW_DN, SKEW_UP = 0.28, 0.10
 CALM_REGIMES = {"CALM CARRY", "STEADY CARRY"}
-# Composite weights over 5 INDEPENDENT axes (our definition, editable). Sum = 1.0
+# Composite weights over 4 axes (our definition, editable). Sum = 1.0
 #   rich   = richness   : percentile of current VRP within the DTE's own history
-#   carry  = carry/day  : VRP per calendar day, ranked across the DTE set (relative)
+#   (carry/day = VRP / calendar days was an axis until 2026-10-13. Measured (proto/
+#    carry_v1): it only tilted the ranking to short tenors — 7 DTE #1 on ~60 % of days vs
+#    ~27 % without — and no variant improved the #1 card's forward outcome. Removed from
+#    the composite, weights redistributed proportionally; still shown on each card.)
 #   safety = reliability+tail-safety, MERGED: the old RELIAB (info ratio) and TAIL
 #            (1-|CVaR5|) axes measure the same thing — Spearman +0.885 on the real
 #            definitions (measured 2026-08-26) — so they are one axis, not two, to
@@ -64,7 +67,7 @@ CALM_REGIMES = {"CALM CARRY", "STEADY CARRY"}
 #            of the SPX path over the forward window (mild path now = high score). A
 #            genuine PATH axis (the price journey), distinct from tail (VRP outcome).
 #   stab   = stability  : steadiness of recent VRP vs its window dispersion
-W = {"rich": 0.30, "carry": 0.15, "safety": 0.35, "path": 0.10, "stab": 0.10}
+W = {"rich": 0.35, "safety": 0.41, "path": 0.12, "stab": 0.12}
 CARD_COLORS = ["--pink", "--yellow", "--blue", "--green"]
 
 REG_ORDER = ["CALM CARRY", "STEADY CARRY", "NEUTRAL RANGE",
@@ -256,7 +259,7 @@ def dte_series(px, dte):
                 vrp_now=vrp_now, mae=mae)
 
 def cards_for(series, N):
-    """Compute all DTE cards for a lookback together (needed for cross-sectional carry)."""
+    """Compute all DTE cards for a lookback (per-DTE, self-relative sub-scores)."""
     raw = {}
     for d in DTES:
         ds  = series[d]
@@ -283,22 +286,18 @@ def cards_for(series, N):
                       cvar=cvar, stab=stab, carry_pd=cur / d, path=path,
                       hit=float((win > 0).mean() * 100) if len(win) else np.nan,
                       worst=float(np.nanmin(win)) if len(win) else np.nan)
-    cps = [raw[d]["carry_pd"] for d in DTES]
-    cmin, cmax = min(cps), max(cps)
-    rng = cmax - cmin
     cards = []
     for d in DTES:
         r = raw[d]
-        carry  = 100 * (r["carry_pd"] - cmin) / rng if rng > 1e-9 else 50.0
         reliab = float(np.clip((0 if np.isnan(r["ir"]) else r["ir"]) / 0.8 * 100, 0, 100))
         # only a NEGATIVE worst-5% outcome is a tail loss (abs() penalised a positive one)
         tail   = float(np.clip(100 * (1 - max(-r["cvar"], 0) / 50), 0, 100)) if not np.isnan(r["cvar"]) else 50.0
         safety = (reliab + tail) / 2.0                       # merged axis (rho +0.885)
         path   = r["path"]
-        subs = {"rich": r["rich"], "carry": carry, "safety": safety, "path": path, "stab": r["stab"]}
+        subs = {"rich": r["rich"], "safety": safety, "path": path, "stab": r["stab"]}
         comp = sum(W[k] * (0 if (subs[k] is None or np.isnan(subs[k])) else subs[k]) for k in W)
         cards.append(dict(dte=d, res_end=series[d]["vrp_hist"].dropna().index[-1].strftime("%d %b %Y"),
-                          cur_iv=jnum(r["cur_iv"]), cur_vrp=jnum(r["cur_vrp"]),
+                          cur_iv=jnum(r["cur_iv"]), cur_vrp=jnum(r["cur_vrp"]), carry_pd=jnum(r["carry_pd"], 2),
                           vrp_pct=jnum(r["rich"]), hit=jnum(r["hit"]), worst=jnum(r["worst"]),
                           composite=jnum(comp), subs={k: jnum(v) for k, v in subs.items()}))
     return cards
@@ -1429,7 +1428,7 @@ TEMPLATE = r"""<meta charset="utf-8">
     <div class="box"><div class="box-title">▶ THE 60-SECOND DAILY READ</div>
       <div class="helptext">
         <b>1 ·</b> Status strip: all five sources fresh? Which <b>regime</b>? (hover any regime name for its rule)<br>
-        <b>2 ·</b> Cards: is <b>CUR VRP</b> positive? Where sits <b>VRP PCT</b>? Which DTE ranks #1 — and <i>why</i> (its five bars)?<br>
+        <b>2 ·</b> Cards: is <b>CUR VRP</b> positive? Where sits <b>VRP PCT</b>? Which DTE ranks #1 — and <i>why</i> (its four bars)?<br>
         <b>3 ·</b> Trade Context: which families are <b>Favored</b> — read the measured evidence line, not just the column.<br>
         <b>4 ·</b> Risk check: the ranked DTE's <b>WORST</b>, plus <b>p5 / Worst</b> for the current regime in the Backtest tab.<br>
         <b>5 ·</b> Cross-check: VRP Matrix for the recent trend, Charts for IV-vs-RV divergence.
@@ -1441,7 +1440,7 @@ TEMPLATE = r"""<meta charset="utf-8">
         <tr><td>VRP PCT</td><td>Richness vs its own history</td><td>≥ 60th = rich · ≤ 30th = thin, patience is a position</td></tr>
         <tr><td>HIT RATE</td><td>How often IV exceeded later realized vol (vol points)</td><td class="warn">~80–85% is NORMAL here — never read it as safety; trade win rates are lower and losses far larger than wins</td></tr>
         <tr><td>Backtest WORST / p5</td><td>Size of the left tail, % of notional</td><td class="bad">THE critical number — position sizing derives from it (next box). The card WORST is the same idea in vol points</td></tr>
-        <tr><td>COMPOSITE</td><td>Premium quality/safety across DTEs</td><td>A ranking of <i>safety</i>, NOT expected P&amp;L — measured, calm conditions precede weaker short-vol returns (complacency). Read <i>why</i> via the five bars</td></tr>
+        <tr><td>COMPOSITE</td><td>Premium quality/safety across DTEs</td><td>A ranking of <i>safety</i>, NOT expected P&amp;L — measured, calm conditions precede weaker short-vol returns (complacency). Read <i>why</i> via the four bars</td></tr>
         <tr><td>Slope VIX3M/VIX</td><td>Term-structure state</td><td>≥ 1 contango = carry-friendly · &lt; 1 backwardation · &lt; 0.97 = STRESS rule</td></tr>
         <tr><td>Validation quintiles</td><td>Does a richer signal pay more forward?</td><td>A rise across <i>all</i> of Q1→Q5 would mean graded information; the verdict line says whether it holds</td></tr>
         <tr><td>RV SPREAD</td><td>rv10 − rv63: realized vol accelerating?</td><td class="warn">&gt; 0 in CALM/STEADY = measured drag on short vol. No rule in TRANSITION (sign flips)</td></tr>
@@ -1456,7 +1455,7 @@ TEMPLATE = r"""<meta charset="utf-8">
         <span class="h4">WHICH STRUCTURE</span>
         Take it from the measured comparison, not from preference. The <b>Straddle</b> earned the most, but its worst trade cost <b class="bad"><span id="h-wsd"></span>%</b> of notional. The <b>Iron Condor</b> gave up roughly half the return and capped the worst trade at <b class="good"><span id="h-wic"></span>%</b> — if you cannot hold through the straddle's tail, the condor IS your trade. <b>Long vol</b> is insurance costing ≈<span id="h-lv"></span>%/trade on average; the <b>calendar</b> earned ≈<span id="h-cal"></span>%/trade after costs — neither is a carry engine.
         <span class="h4">WHICH TENOR (DTE)</span>
-        The #1-ranked card — but check <i>why</i>: a rank driven by <b>CARRY</b> (most premium per day) is a different trade than one driven by <b>RICH</b> (statistically stretched). Treat <b>7 DTE</b> as indicative only (short-end interpolation).
+        The #1-ranked card — but check <i>why</i>: a rank driven by <b>RICH</b> (statistically stretched) is a different trade than one driven by <b>SAFETY</b> or <b>PATH</b> (calm record). CARRY/DAY on each card shows how much premium per day the tenor pays — short tenors always lead there. Treat <b>7 DTE</b> as indicative only (short-end interpolation).
         <span class="h4">WHEN</span>
         Best measured conditions: VRP PCT elevated and a regime with a positive measured record (hover it). Staying flat in NEUTRAL RANGE costs little and skipped the straddle's only negative pocket.
         <span class="h4">HOW MUCH — THE CRITICAL ONE</span>
@@ -1488,7 +1487,7 @@ TEMPLATE = r"""<meta charset="utf-8">
     <div class="box"><div class="box-title">▶ DATA SOURCES</div><div class="kvlist" id="set-src"></div></div>
     <div class="box"><div class="box-title">▶ PARAMETERS</div><div class="kvlist" id="set-par"></div></div>
     <div class="box"><div class="box-title">▶ COMPOSITE WEIGHTS (edit W in vrpx.py)</div><div class="kvlist" id="set-w"></div></div>
-    <div class="box"><div class="box-title">▶ SUB-SCORES · five axes (0–100)</div><div class="rules" id="set-subs"></div></div>
+    <div class="box"><div class="box-title">▶ SUB-SCORES · four axes (0–100)</div><div class="rules" id="set-subs"></div></div>
     <div class="box"><div class="box-title">▶ REGIME RULES</div><div class="rules" id="set-rules"></div></div>
   </div>
 
@@ -1514,7 +1513,7 @@ const el=id=>document.getElementById(id);
 /* ---- hover tooltips ---- */
 const TIP={
   RICH:"Richness — percentile of the current VRP within this DTE's own trailing history. High = implied vol rich vs its own norm.",
-  CARRY:"Carry per day — VRP ÷ calendar days, ranked across the four DTEs (min–max). Which tenor pays the most premium per day right now.",
+  "CARRY/DAY":"Nowcast VRP ÷ calendar days to expiry (vol points per day). Short tenors pay more per day by construction (theta) — shown for information, not part of the composite: as a ranking axis it measurably only tilted the #1 card to 7 DTE.",
   SAFETY:"Safety — merged reliability (info ratio) + tail-safety (1 − max(−CVaR₅,0)/50) of forward VRP. These two measured the same thing (Spearman +0.89) so they are one axis. Higher = consistent edge with a milder left tail.",
   PATH:"Path-safety — trailing mean Max Adverse Excursion of the SPX path over the forward window, percentile of recent (21d) path risk within this DTE's own window history, inverted. High = the price path has been mild lately vs its norm (the path, not the VRP outcome).",
   STAB:"Stability — how steady recent VRP (21 sessions) is vs the whole window's dispersion. High = calm, predictable premium.",
@@ -1524,7 +1523,7 @@ const TIP={
   "HIT RATE":"Share of the lookback window in which IV exceeded the subsequently realized vol (vol points). Not a trade win rate — those are in the Backtest tab and are lower.",
   WORST:"Most negative forward VRP in the window, in vol points (realized vol exploded past implied). This DTE's left tail — not a P&L %; sizing uses the Backtest tab.",
   STABILITY:"0–100: steadiness of recent VRP vs the window's dispersion (same measure as the STAB bar).",
-  COMPOSITE:"Weighted blend of the five sub-scores (weights & definitions in Settings). Ranks premium quality/safety across DTEs — NOT expected P&L (calm, safe-looking conditions measurably precede weaker short-vol returns)."
+  COMPOSITE:"Weighted blend of the four sub-scores (weights & definitions in Settings). Ranks premium quality/safety across DTEs — NOT expected P&L (calm, safe-looking conditions measurably precede weaker short-vol returns)."
 };
 const REGTIP={
   "CALM CARRY":"Rule: slope ≥1.05 & SPX above 200d MA & VIX <17 — quiet contango bull. Caution: the largest historical short-vol losses started here.",
@@ -1591,11 +1590,12 @@ function cardHTML(c,rank,color,best,weak){
     <div class="metrics">
       ${mRow("CUR IV",`<span class="mv">${num(c.cur_iv,1,"%")}</span>`)}
       ${mRow("CUR VRP",`<span class="mv ${neg}">${num(c.cur_vrp,1," pts")}</span>`)}
+      ${mRow("CARRY/DAY",`<span class="mv">${num(c.carry_pd,2," pts")}</span>`)}
       ${mRow("VRP PCT",`<span class="mv">${ord(c.vrp_pct)}</span>`)}
       ${mRow("HIT RATE",`<span class="mv">${num(c.hit,0,"%")}</span>`)}
       ${mRow("WORST",`<span class="mv neg">${num(c.worst,1," pts")}</span>`)}
       ${mRow("STABILITY",`<span class="mv">${num(s.stab,0)}/100</span>`)}</div>
-    <div class="bars">${barRow("RICH",s.rich)}${barRow("CARRY",s.carry)}${barRow("SAFETY",s.safety)}${barRow("PATH",s.path)}${barRow("STAB",s.stab)}</div></div>`;
+    <div class="bars">${barRow("RICH",s.rich)}${barRow("SAFETY",s.safety)}${barRow("PATH",s.path)}${barRow("STAB",s.stab)}</div></div>`;
 }
 
 function slice(a,n){return a.slice(-n);}
@@ -1849,7 +1849,7 @@ function render(){
     (DATA.held_back?`<div class="row"><span class="rk">AS-OF HELD</span><span class="rv">${DATA.asof} — waiting for ${DATA.waiting.join(", ")} (${DATA.held_back} newer session${DATA.held_back>1?"s":""} not used yet; nothing forward-filled)</span></div>`:"");
   el("set-par").innerHTML=[["History start",DATA.first],["As of",DATA.asof],["Total sessions",DATA.n_total],["DTE horizons",DATA.dtes.join(" / ")],["Lookbacks",Object.values(DATA.lookbacks).map(l=>l.name).join(" · ")],["Term nodes (days)",Object.entries(DATA.node_days).map(([k,v])=>k+"="+v).join(" · ")],["Forecast horizon",DATA.forecast.horizon+" trading days (streak-adjusted persistence)"]].map(([k,x])=>`<div class="row"><span class="rk">${k}</span><span class="rv">${x}</span></div>`).join("");
   el("set-w").innerHTML=Object.entries(DATA.weights).map(([k,x])=>`<div class="row"><span class="rk">${k.toUpperCase()}</span><span class="rv">${x}%</span></div>`).join("");
-  el("set-subs").innerHTML=`<b style="color:var(--ink-dim)">RICH</b> — richness: percentile of today's nowcast VRP among this DTE's nowcasts in the window (rich IV vs its norm).<br><b style="color:var(--ink-dim)">CARRY</b> — carry per day: VRP ÷ calendar days, ranked across the DTE set (which tenor pays most premium per day now, relative). By construction it favours short tenors — measured 2013+: with CARRY the 7-DTE card ranks #1 on ~60% of days, without it ~27%. The #1 card's subsequent forward VRP sat at the ~50th percentile of its own history in every variant, so this tilt is a preference for short tenors, not forecast information.<br><b style="color:var(--ink-dim)">SAFETY</b> — merged reliability (info ratio = mean ÷ std of forward VRP) + tail-safety (1 − max(−CVaR₅,0)/50). These two were measured to be redundant (Spearman +0.89 on the real definitions, 2026-08-26), so they are one axis to avoid double-counting.<br><b style="color:var(--ink-dim)">PATH</b> — path-safety: trailing mean Max Adverse Excursion of the SPX price path over the forward window, inverted percentile within its own window history. A genuine <i>path</i> axis (the price journey), distinct from SAFETY's VRP-outcome tail.<br><b style="color:var(--ink-dim)">STAB</b> — stability: steadiness of the last 21 nowcasts vs the window's nowcast dispersion.<br>Five axes — level, cross-sectional carry, outcome safety, path safety, steadiness — mostly weakly correlated; at 7 DTE RICH and CARRY co-move, so short-tenor richness is partly counted twice. <b>Note:</b> the composite ranks premium <i>quality/safety</i>, not expected P&L — measured (2026-08-26) low-vol conditions precede weaker short-vol returns (complacency).`;
+  el("set-subs").innerHTML=`<b style="color:var(--ink-dim)">RICH</b> — richness: percentile of today's nowcast VRP among this DTE's nowcasts in the window (rich IV vs its norm).<br><b style="color:var(--ink-dim)">CARRY/DAY</b> (card value, not in the composite since 2026-10-13) — VRP ÷ calendar days. As a cross-DTE ranking axis it favoured short tenors by construction (7 DTE #1 on ~60% of days vs ~27% without) and no variant improved the #1 card's subsequent forward VRP (~50th percentile of its own history in every variant), so it was removed.<br><b style="color:var(--ink-dim)">SAFETY</b> — merged reliability (info ratio = mean ÷ std of forward VRP) + tail-safety (1 − max(−CVaR₅,0)/50). These two were measured to be redundant (Spearman +0.89 on the real definitions, 2026-08-26), so they are one axis to avoid double-counting.<br><b style="color:var(--ink-dim)">PATH</b> — path-safety: trailing mean Max Adverse Excursion of the SPX price path over the forward window, inverted percentile within its own window history. A genuine <i>path</i> axis (the price journey), distinct from SAFETY's VRP-outcome tail.<br><b style="color:var(--ink-dim)">STAB</b> — stability: steadiness of the last 21 nowcasts vs the window's nowcast dispersion.<br>Four axes — level, outcome safety, path safety, steadiness — each measured within the DTE's own history, so no tenor is favoured by construction. <b>Note:</b> the composite ranks premium <i>quality/safety</i>, not expected P&L — measured (2026-08-26) low-vol conditions precede weaker short-vol returns (complacency).`;
   el("set-rules").innerHTML=`VIX≥40 → <code>VOL SHOCK</code> · VIX≥28 or slope&lt;0.97 → <code>STRESS / BACKW</code> · VIX≥20 → <code>TRANSITION</code> · slope≥1.05 &amp; uptrend &amp; VIX&lt;17 → <code>CALM CARRY</code> · slope≥1.0 &amp; uptrend → <code>STEADY CARRY</code> · else → <code>NEUTRAL RANGE</code>.<br>slope = VIX3M / VIX (&gt;1 contango). uptrend = SPX &gt; 200-day moving average.`;
 
   /* HELP — live numbers injected from the dataset */
@@ -1870,7 +1870,7 @@ function render(){
    el("h-size").textContent=wsd?Math.round(2/Math.abs(wsd)*100):"—";}
 
   const wt=DATA.weights;
-  el("foot").innerHTML=`<b>Composite over five axes:</b> RICHNESS ${wt.rich}% · CARRY/day ${wt.carry}% · SAFETY ${wt.safety}% · PATH ${wt.path}% · STABILITY ${wt.stab}%. &nbsp;·&nbsp; <b>VRP</b> = interpolated implied vol − horizon-matched realized vol, vol points. Percentile/safety/path/validation use forward RV or the forward price path; the nowcast uses trailing RV. Free public data only (Yahoo ^GSPC, Cboe VIX family). Research tool — evidence, not advice. Not investment advice.`;
+  el("foot").innerHTML=`<b>Composite over four axes:</b> RICHNESS ${wt.rich}% · SAFETY ${wt.safety}% · PATH ${wt.path}% · STABILITY ${wt.stab}%. &nbsp;·&nbsp; <b>VRP</b> = interpolated implied vol − horizon-matched realized vol, vol points. Percentile/safety/path/validation use forward RV or the forward price path; the nowcast uses trailing RV. Free public data only (Yahoo ^GSPC, Cboe VIX family). Research tool — evidence, not advice. Not investment advice.`;
 }
 
 el("tabs").addEventListener("click",e=>{const b=e.target.closest(".tab");if(!b)return;state.tab=b.dataset.tab;

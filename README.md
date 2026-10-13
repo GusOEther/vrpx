@@ -6,7 +6,7 @@ One Python script downloads ~15 years of SPX + VIX-family history, computes ever
 
 ## What it computes — all measured, nothing decorative
 
-- **Overview** — per-DTE scorecards (7/14/21/30): interpolated IV, nowcast VRP, percentile, hit rate, worst forward VRP, and a documented composite over five axes (richness · carry/day · safety · path · stability) that ranks premium *quality*, not expected P&L
+- **Overview** — per-DTE scorecards (7/14/21/30): interpolated IV, nowcast VRP, percentile, hit rate, worst forward VRP, and a documented composite over four axes (richness · safety · path · stability; carry per day shown on each card) that ranks premium *quality*, not expected P&L
 - **Trade context** — each option structure assigned to Favored / Acceptable / Caution **from its own measured per-regime backtest stats** with disclosed, hand-set cut-offs, plus a measured realized-vol-acceleration caution in the carry regimes
 - **Expected move** — IV-implied ±1σ range and ≈16Δ strikes per DTE, next to the measured share of past entries that finished inside (80–85 % vs the nominal 68 %) and the size of the misses
 - **VRP matrix** — monthly VRP by DTE, 24-month heatmap
