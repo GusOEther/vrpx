@@ -2,13 +2,17 @@ name: build-and-deploy
 
 on:
   schedule:
-    - cron: "30 23 * * 1-5"   # weekdays 23:30 UTC — after US close & index settlement
+    # Mon–Sat 11:00 UTC = previous US session. Cboe publishes VIX9D/3M/6M ~22:30-23:00 UTC
+    # but the VIX close only overnight (seen between ~02:00 and 08:30 UTC; every 23:30 run
+    # 2026-09-17..10-02 read the previous day's VIX). 11:00 UTC is before the US open in both
+    # DST states; load() additionally holds the as-of until every close is published.
+    - cron: "0 11 * * 1-6"
   workflow_dispatch:           # manual runs from the Actions tab
   push:
     branches: [main]           # every push redeploys with fresh data
 
 permissions:
-  contents: write          # commit the forward-test log back to the repo
+  contents: write              # commit the v2 forward-test log back to origin/v2
   pages: write
   id-token: write
 
@@ -23,6 +27,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
+      # ---- stable (main) ----
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -32,29 +37,98 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Build report (with retries — Yahoo sometimes throttles CI IPs)
+      - name: Build stable report (retries — Yahoo throttles CI IPs)
         run: |
           for i in 1 2 3; do
-            if python vrpx.py; then exit 0; fi
+            if python vrpx.py; then break; fi
             if [ "$i" -lt 3 ]; then echo "attempt $i failed — retrying in 180s"; sleep 180; fi
+            if [ "$i" -eq 3 ]; then echo "stable build failed — previous deployment stays live"; exit 1; fi
           done
-          echo "all attempts failed — previous deployment stays live"
-          exit 1
+          mkdir -p dist
+          cp vrpx_report.html dist/index.html
 
-      - name: Commit forward-test log
+      # ---- preview (v2) — checked out separately so it can build + log forward test ----
+      - name: Checkout v2 into ./v2src
+        uses: actions/checkout@v4
+        with:
+          ref: v2
+          path: v2src
+
+      - name: Build preview report (v2) — best effort, must not break stable
+        id: preview
+        continue-on-error: true
         run: |
+          cd v2src
+          for i in 1 2 3; do
+            if python vrpx.py; then break; fi
+            if [ "$i" -lt 3 ]; then echo "v2 attempt $i failed — retrying in 120s"; sleep 120; fi
+            if [ "$i" -eq 3 ]; then echo "v2 build failed — preview will be skipped this run"; exit 1; fi
+          done
+          mkdir -p ../dist/preview
+          cp vrpx_report.html ../dist/preview/index.html
+
+      # Pages publishes dist as the WHOLE site: without this a failed preview build would
+      # turn /preview/ into a 404 while the run stays green.
+      - name: Keep last good preview if the v2 build failed
+        if: steps.preview.outcome != 'success'
+        run: |
+          mkdir -p dist/preview
+          if curl -fsSL https://gusoether.github.io/vrpx/preview/ -o dist/preview/index.html; then
+            echo "::warning::v2 preview build failed — redeployed the last live preview"
+          else
+            rm -f dist/preview/index.html
+            echo "::warning::v2 preview build failed and no previous preview could be fetched"
+          fi
+
+      # The log commit must never block the deploy (continue-on-error); a push race with a
+      # human push to v2 is retried once after a rebase, a lost session is backfilled by
+      # the next build's forward_test.
+      - name: Commit v2 forward-test log
+        if: steps.preview.outcome == 'success'
+        continue-on-error: true
+        run: |
+          cd v2src
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add forecast_forward.csv
           if ! git diff --staged --quiet; then
-            git commit -m "forward-test: log/resolve $(date -u +%F) [skip ci]"
-            git push
+            ASOF=$(tail -n 1 forecast_forward.csv | cut -d, -f1)
+            git commit -m "forward-test: log/resolve as-of $ASOF [skip ci]"
+            git push origin HEAD:v2 || (git pull --rebase origin v2 && git push origin HEAD:v2)               || echo "::warning::forward log not pushed — next build backfills"
           else
             echo "no forward-test change"
           fi
 
-      - name: Stage site
-        run: mkdir -p dist && cp vrpx_report.html dist/index.html
+      # ---- inject the stable <-> preview switch banner into both pages ----
+      - name: Inject variant switch
+        run: |
+          python - <<'PY'
+          import os
+          BASE = "/vrpx"
+          def banner(active):
+              def a(name, href, on):
+                  col = "#3ddc84" if on else "#7b8aa0"
+                  wt  = "700" if on else "400"
+                  return f'<a href="{href}" style="color:{col};font-weight:{wt};text-decoration:none">{name}</a>'
+              return ('<div style="text-align:center;padding:5px 8px;background:#0a0e14;'
+                      'border-bottom:1px solid #141c26;font-family:monospace;font-size:11px;'
+                      'letter-spacing:1px;color:#4d5a6d">VERSION&nbsp; '
+                      + a("STABLE", f"{BASE}/", active=="stable")
+                      + '&nbsp;·&nbsp;'
+                      + a("PREVIEW (v2)", f"{BASE}/preview/", active=="preview")
+                      + '</div>')
+          def inject(path, active):
+              if not os.path.exists(path):
+                  return
+              html = open(path, encoding="utf-8").read()
+              anchor = '<div class="app">'
+              if anchor in html and "VERSION&nbsp;" not in html:
+                  html = html.replace(anchor, banner(active) + anchor, 1)
+                  open(path, "w", encoding="utf-8").write(html)
+                  print("injected", active, "into", path)
+          inject("dist/index.html", "stable")
+          inject("dist/preview/index.html", "preview")
+          PY
 
       - uses: actions/configure-pages@v5
         with:
